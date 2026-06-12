@@ -1,0 +1,30 @@
+{
+  "name": "undercast",
+  "version": "0.1.0",
+  "description": "The self-aware overlay for OBS — a ticker that listens to your stream and runs itself",
+  "type": "module",
+  "bin": {
+    "undercast": "bin/undercast"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "public",
+    "scripts",
+    "server.mjs",
+    "README*"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "repository": "github:serejaris/undercast",
+  "keywords": [
+    "obs",
+    "overlay",
+    "ticker",
+    "streaming",
+    "live",
+    "obs-websocket"
+  ]
+}

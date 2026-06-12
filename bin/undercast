@@ -1,0 +1,384 @@
+#!/usr/bin/env node
+// undercast — unified CLI for the self-aware OBS overlay.
+// Subcommands: serve | ticker | plan | screen | companion | chatfeed | obs
+// Zero dependencies. The old bin/{ticker,plan,screen} are thin wrappers over this.
+import { readFileSync, writeFileSync, existsSync, openSync, rmSync, mkdirSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { loadConfig } from '../lib/config.mjs';
+
+const SELF = fileURLToPath(import.meta.url);
+const ROOT = dirname(dirname(SELF));
+const config = loadConfig();
+const BASE = config.baseUrl;
+const SERVER = join(ROOT, 'server.mjs');
+const PIDFILE = join(config.stateDir, 'server.pid');
+const LOGFILE = join(config.stateDir, 'server.log');
+
+function fail(msg) {
+  console.error(msg);
+  process.exit(1);
+}
+
+function usage(msg) {
+  console.error(`usage: ${msg}`);
+  process.exit(1);
+}
+
+async function http(method, path, body) {
+  let res;
+  try {
+    res = await fetch(BASE + path, {
+      method,
+      headers: body !== undefined ? { 'content-type': 'application/json' } : undefined,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+  } catch {
+    fail(`undercast: server unreachable at ${BASE} — start it with: undercast serve start`);
+  }
+  if (!res.ok) {
+    let err = `HTTP ${res.status}`;
+    try {
+      err = (await res.json()).error || err;
+    } catch {
+      // non-JSON error body — keep the status line
+    }
+    fail(`undercast: ${err}`);
+  }
+  return res;
+}
+
+const post = (path, body) => http('POST', path, body);
+const getJson = async (path) => (await http('GET', path)).json();
+
+// flash is decoration — never fail the main command over it
+async function flashStep(text) {
+  try {
+    await fetch(`${BASE}/screen`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ mode: 'flash', title: `▶ ${text}`, seconds: 6 }),
+    });
+  } catch {
+    // best-effort
+  }
+}
+
+function isAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readPid() {
+  if (!existsSync(PIDFILE)) return null;
+  const pid = Number(readFileSync(PIDFILE, 'utf8').trim());
+  return pid > 0 && isAlive(pid) ? pid : null;
+}
+
+function execPassthrough(file, args) {
+  const child = spawn(file, args, { stdio: 'inherit' });
+  child.on('error', (e) => fail(`undercast: cannot run ${file}: ${e.message}`));
+  child.on('exit', (code, signal) => process.exit(signal ? 1 : code ?? 0));
+}
+
+// --- serve: the overlay server, foreground or daemonized -------------------
+
+function serve(args) {
+  const sub = args[0] || 'fg';
+  if (sub === 'fg') {
+    execPassthrough(process.execPath, [SERVER]);
+    return;
+  }
+  if (sub === 'start') {
+    const pid = readPid();
+    if (pid) {
+      console.log(`already running (pid ${pid})`);
+      return;
+    }
+    mkdirSync(config.stateDir, { recursive: true });
+    const log = openSync(LOGFILE, 'a');
+    const child = spawn(process.execPath, [SERVER], { detached: true, stdio: ['ignore', log, log] });
+    child.unref();
+    writeFileSync(PIDFILE, String(child.pid));
+    console.log(`ok: server started (pid ${child.pid}), log: ${LOGFILE}`);
+    return;
+  }
+  if (sub === 'stop') {
+    const pid = readPid();
+    if (pid) {
+      process.kill(pid);
+      console.log('ok: server stopped');
+    } else {
+      console.log('not running');
+    }
+    rmSync(PIDFILE, { force: true });
+    return;
+  }
+  if (sub === 'status') {
+    const pid = readPid();
+    if (pid) {
+      console.log(`running (pid ${pid}), ${BASE}`);
+      return;
+    }
+    // no pidfile — the server may have been started externally (nohup etc.)
+    fetch(`${BASE}/state`, { signal: AbortSignal.timeout(1500) })
+      .then((r) => console.log(r.ok ? `running (no pidfile — started externally), ${BASE}` : 'stopped'))
+      .catch(() => console.log('stopped'));
+    return;
+  }
+  usage('undercast serve [start|stop|status]');
+}
+
+// --- ticker: the running line ----------------------------------------------
+
+async function ticker(args) {
+  const cmd = args.shift() || 'status';
+  switch (cmd) {
+    case 'set': {
+      if (!args.length) usage('undercast ticker set "text" ["text2" ...]');
+      await post('/set', { items: args });
+      console.log(`ok: ${args.join(' ')}`);
+      return;
+    }
+    case 'add': {
+      if (!args.length) usage('undercast ticker add "text"');
+      await post('/add', { text: args[0] });
+      console.log(`ok: +${args[0]}`);
+      return;
+    }
+    case 'now': {
+      // undercast ticker now "what we are doing" | now "" (clear the slot)
+      const text = args[0] ?? '';
+      await post('/now', { text });
+      console.log(`ok: now=${text || '<cleared>'}`);
+      return;
+    }
+    case 'news': {
+      if (!args.length) usage('undercast ticker news "news text"');
+      await post('/news', { text: args[0] });
+      console.log(`ok: news+ ${args[0]}`);
+      return;
+    }
+    case 'chat': {
+      if (!args.length) usage('undercast ticker chat "chat message" [author]');
+      const payload = { text: args[0] };
+      if (args[1]) payload.author = args[1];
+      await post('/chat', payload);
+      console.log(`ok: chat+ ${args[0]}`);
+      return;
+    }
+    case 'clear': {
+      // undercast ticker clear [now|news|chat|note] — no argument clears everything
+      await post('/clear', args[0] ? { type: args[0] } : {});
+      console.log(args[0] ? `ok: cleared ${args[0]}` : 'ok: cleared');
+      return;
+    }
+    case 'speed': {
+      if (!args.length) usage('undercast ticker speed 120');
+      await post('/config', { speed: Number(args[0]) });
+      console.log(`ok: speed=${args[0]}`);
+      return;
+    }
+    case 'hide':
+      await post('/config', { visible: false });
+      console.log('ok: hidden');
+      return;
+    case 'show':
+      await post('/config', { visible: true });
+      console.log('ok: visible');
+      return;
+    case 'mode': {
+      // undercast ticker mode plan|off — switch; no argument prints the current mode
+      if (args.length) {
+        if (!['plan', 'off'].includes(args[0])) usage('undercast ticker mode [plan|off]');
+        await post('/mode', { mode: args[0] });
+        console.log(`ok: mode=${args[0]}`);
+      } else {
+        console.log((await getJson('/state')).mode ?? 'off');
+      }
+      return;
+    }
+    case 'status':
+      console.log(JSON.stringify(await getJson('/state'), null, 2));
+      return;
+    default:
+      usage('undercast ticker now|news|chat|set|add|clear|speed|hide|show|mode|status');
+  }
+}
+
+// --- plan: auto-history of stream stages ------------------------------------
+
+const PLAN_MARKS = { done: '✓', current: '▶', pending: '·' };
+
+async function plan(args) {
+  const cmd = args.shift() || 'show';
+  switch (cmd) {
+    case 'append': {
+      if (!args.length) usage('undercast plan append "new stage"');
+      await post('/plan/append', { text: args[0] });
+      console.log(`ok: new stage — ${args[0]}`);
+      await flashStep(args[0]);
+      return;
+    }
+    case 'set': {
+      // debug override — the plan is normally built by companion from the transcript
+      if (!args.length) usage('undercast plan set (debug) "step 1" "step 2" ...');
+      await post('/plan', { steps: args });
+      console.log(`ok (debug): plan of ${args.length} steps, first is current`);
+      return;
+    }
+    case 'show': {
+      const p = (await getJson('/state')).plan;
+      if (!p?.steps?.length) {
+        console.log('no plan');
+        return;
+      }
+      p.steps.forEach((s, i) => console.log(`${PLAN_MARKS[s.status]} ${i + 1}. ${s.text}`));
+      return;
+    }
+    case 'current': {
+      if (!args.length) usage('undercast plan current N (1-based)');
+      const idx = Number(args[0]) - 1;
+      const p = await (await post('/plan/current', { index: idx })).json();
+      console.log(`ok: current step — ${args[0]}`);
+      await flashStep(p.steps[idx].text);
+      return;
+    }
+    case 'next': {
+      const p = await (await post('/plan/done', {})).json();
+      const step = p.steps.find((s) => s.status === 'current')?.text;
+      if (step) {
+        console.log(`ok: moving on — ${step}`);
+        await flashStep(step);
+      } else {
+        console.log('ok: plan finished ✓');
+      }
+      return;
+    }
+    case 'export': {
+      const res = await http('GET', `/plan/export?format=${args[0] || 'chapters'}`);
+      process.stdout.write(await res.text());
+      return;
+    }
+    case 'clear':
+      await post('/plan', { steps: [] });
+      console.log('ok: plan cleared');
+      return;
+    default:
+      usage('undercast plan append|show|current|next|export|clear|set(debug)');
+  }
+}
+
+// --- screen: full-screen interstitials ---------------------------------------
+
+async function screen(args) {
+  const cmd = args.shift() || 'status';
+  switch (cmd) {
+    case 'start': {
+      if (!args.length) usage('undercast screen start "Stream topic" [minutes=5]');
+      const minutes = Number(args[1] ?? 5);
+      await post('/screen', { mode: 'start', title: args[0], minutes });
+      console.log(`ok: countdown ${minutes} min — ${args[0]}`);
+      return;
+    }
+    case 'brb':
+      await post('/screen', { mode: 'brb', sub: args[0] ?? '' });
+      console.log('ok: be right back');
+      return;
+    case 'end':
+      await post('/screen', { mode: 'end', sub: args[0] ?? '' });
+      console.log('ok: stream ended');
+      return;
+    case 'flash': {
+      if (!args.length) usage('undercast screen flash "Text" [seconds=8]');
+      const seconds = Number(args[1] ?? 8);
+      await post('/screen', { mode: 'flash', title: args[0], seconds });
+      console.log(`ok: flash ${seconds}s — ${args[0]}`);
+      return;
+    }
+    case 'off':
+      await post('/screen', { mode: 'off' });
+      console.log('ok: screen off');
+      return;
+    case 'status':
+      console.log(JSON.stringify((await getJson('/state')).screen));
+      return;
+    default:
+      usage('undercast screen start|brb|end|flash|off|status');
+  }
+}
+
+// --- obs: setup and inspection helpers ---------------------------------------
+
+const OBS_SCRIPTS = {
+  'add-ticker': 'obs-add-ticker.mjs',
+  'add-screens': 'obs-add-screens.mjs',
+  req: 'obs-req.mjs',
+  screenshot: 'obs-screenshot.mjs',
+};
+
+function obs(args) {
+  const script = OBS_SCRIPTS[args[0]];
+  if (!script) usage('undercast obs add-ticker|add-screens|req|screenshot [...]');
+  execPassthrough(process.execPath, [join(ROOT, 'scripts', script), ...args.slice(1)]);
+}
+
+// --- dispatch -----------------------------------------------------------------
+
+const HELP = `undercast — the self-aware overlay for OBS
+
+usage: undercast <command> [...]
+
+  serve [start|stop|status]  overlay server (foreground without an argument)
+  ticker <cmd>               ticker line: now|news|chat|set|add|clear|speed|hide|show|mode|status
+  plan <cmd>                 stream plan: append|show|current|next|export|clear|set(debug)
+  screen <cmd>               interstitials: start|brb|end|flash|off|status
+  companion <cmd>            Granola → plan/now daemon: start|stop|status|once
+  chatfeed <cmd>             YouTube chat → ticker daemon: start|stop|status|once|smoke
+  obs <cmd>                  OBS helpers: add-ticker|add-screens|req|screenshot
+
+env: UNDERCAST_PORT (default 8722), UNDERCAST_URL, UNDERCAST_CHANNEL, UNDERCAST_YT_TOKEN,
+     UNDERCAST_STATE_DIR; legacy aliases: PORT, TICKER_URL — see README for details`;
+
+const [cmd, ...rest] = process.argv.slice(2);
+
+switch (cmd) {
+  case 'serve':
+    serve(rest);
+    break;
+  case 'ticker':
+    await ticker(rest);
+    break;
+  case 'plan':
+    await plan(rest);
+    break;
+  case 'screen':
+    await screen(rest);
+    break;
+  case 'companion':
+    execPassthrough(join(ROOT, 'bin', 'companion'), rest);
+    break;
+  case 'chatfeed':
+    execPassthrough(join(ROOT, 'bin', 'chatfeed'), rest);
+    break;
+  case 'obs':
+    obs(rest);
+    break;
+  case '--version':
+  case '-v':
+    console.log(JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version);
+    break;
+  case '--help':
+  case '-h':
+  case 'help':
+    console.log(HELP);
+    break;
+  default:
+    console.error(HELP);
+    process.exit(1);
+}

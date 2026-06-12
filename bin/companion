@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# Granola → ticker companion daemon.
+# Every N seconds asks Claude (with the official Granola MCP) what is happening
+# in the current stream session. On topic change: updates the ticker "now" slot
+# and fires a full-screen flash with the new topic. The stream plan is built as
+# auto-history: when a new stage of the conversation begins, the companion
+# appends it via POST /plan/append (past steps ✓, new step ▶, no pending steps).
+#
+# Prereq: one-time OAuth — in any Claude Code session run /mcp → granola → authenticate.
+# Usage: companion start | stop | status | once
+set -uo pipefail
+
+# env-only config here (documented simplification: bash side does not parse undercast.config.json)
+BASE="${UNDERCAST_URL:-${TICKER_URL:-http://127.0.0.1:8722}}"
+INTERVAL="${COMPANION_INTERVAL:-180}"
+MODEL="${COMPANION_MODEL:-haiku}"
+STATE_DIR="${UNDERCAST_STATE_DIR:-$HOME/.local/state/undercast}"
+mkdir -p "$STATE_DIR"
+PIDFILE="$STATE_DIR/companion.pid"
+LOGFILE="$STATE_DIR/companion.log"
+
+BASE_PROMPT='Find the most recent meeting in Granola from today (it is my live stream).
+Read the tail of the transcript — the last 2-3 minutes of conversation. Identify the DOMINANT topic of those minutes.
+If there are no meetings today or the transcript is empty, answer exactly: NO_MEETING'
+
+current_now() {
+  curl -sf "$BASE/state" | python3 -c 'import json,sys
+items = json.load(sys.stdin).get("items", [])
+print(next((i["text"] for i in items if i.get("type") == "now"), ""))' 2>/dev/null
+}
+
+# existing plan steps (auto-history) as "- text" lines + current step text ("" if no plan)
+plan_context() {
+  curl -sf "$BASE/state" | python3 -c 'import json,sys
+plan = json.load(sys.stdin).get("plan") or {}
+steps = plan.get("steps") or []
+for s in steps:
+    print(f"- {s[\"text\"]}")
+print("CUR=" + next((s["text"] for s in steps if s["status"] == "current"), ""))' 2>/dev/null
+}
+
+update_once() {
+  ctx=$(plan_context)
+  cur_stage=$(echo "$ctx" | sed -n 's/^CUR=//p')
+  stages=$(echo "$ctx" | grep -v '^CUR=' || true)
+
+  if [ -n "$stages" ]; then
+    prompt="$BASE_PROMPT
+
+Stream stages so far (auto-history, the last one is the current stage):
+$stages
+
+Answer with EXACTLY two lines. Keep the protocol keywords (STAGE, SAME, NOW) literal; write the titles and descriptions in the language spoken in the meeting:
+STAGE: <SAME if the conversation stage has not changed from the current one (\"$cur_stage\"); otherwise a short title for the new stage — 5 words max, not repeating the stages above>
+NOW: <one line, 90 characters max — what we are doing right now; verb + essence, no quotes>"
+  else
+    prompt="$BASE_PROMPT
+
+No stream stages recorded yet — this is the very beginning.
+
+Answer with EXACTLY two lines. Keep the protocol keywords (STAGE, NOW) literal; write the titles and descriptions in the language spoken in the meeting:
+STAGE: <a short title for the first stage of the stream — 5 words max>
+NOW: <one line, 90 characters max — what we are doing right now; verb + essence, no quotes>"
+  fi
+
+  out=$(claude -p "$prompt" --model "$MODEL" --allowedTools "mcp__granola__*" 2>/dev/null)
+  if [ -z "$out" ]; then
+    echo "$(date +%H:%M:%S) companion: empty response from claude" >&2
+    return 1
+  fi
+  if echo "$out" | grep -q "NO_MEETING"; then
+    echo "$(date +%H:%M:%S) companion: no meeting today, skipping"
+    return 0
+  fi
+
+  line=$(echo "$out" | sed -n 's/^NOW:[[:space:]]*//p' | tail -1)
+  stage=$(echo "$out" | sed -n 's/^STAGE:[[:space:]]*//p' | tail -1 | sed 's/[[:space:]]*$//')
+  # malformed response (permission prompts, chatter) must never reach the ticker
+  if [ -z "$line" ] && [ -z "$stage" ]; then
+    echo "$(date +%H:%M:%S) companion: no NOW:/STAGE: in response, skipping — raw: $(echo "$out" | head -c 200)" >&2
+    return 1
+  fi
+
+  moved=""
+  # append a new stage unless the model says SAME or echoes the current stage back (unicode-aware dedup)
+  if [ -n "$stage" ] && [ "$(echo "$stage" | tr '[:upper:]' '[:lower:]')" != "same" ] \
+    && python3 -c 'import sys; sys.exit(0 if sys.argv[1].strip().lower() != sys.argv[2].strip().lower() else 1)' "$stage" "$cur_stage"; then
+    payload=$(python3 -c 'import json,sys; print(json.dumps({"text": sys.argv[1].strip()}))' "$stage")
+    curl -sf -X POST -H 'content-type: application/json' -d "$payload" "$BASE/plan/append" >/dev/null 2>&1 && moved=1
+    if [ -n "$moved" ]; then
+      flash=$(python3 -c 'import json,sys; print(json.dumps("▶ " + sys.argv[1].strip()))' "$stage")
+      curl -sf -X POST -H 'content-type: application/json' -d "{\"mode\":\"flash\",\"title\": $flash,\"seconds\":7}" "$BASE/screen" >/dev/null
+      echo "$(date +%H:%M:%S) plan: new stage — $stage"
+    fi
+  fi
+
+  if [ -n "$line" ] && [ "$line" != "$(current_now)" ]; then
+    text=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1][:120]))' "$line")
+    curl -sf -X POST -H 'content-type: application/json' -d "{\"text\": $text}" "$BASE/now" >/dev/null
+    if [ -z "$moved" ]; then
+      curl -sf -X POST -H 'content-type: application/json' -d "{\"mode\":\"flash\",\"title\": $text,\"seconds\":8}" "$BASE/screen" >/dev/null
+    fi
+    echo "$(date +%H:%M:%S) now: $line"
+  else
+    echo "$(date +%H:%M:%S) companion: topic unchanged"
+  fi
+}
+
+run_loop() {
+  echo "companion: loop every ${INTERVAL}s (model: $MODEL)"
+  while true; do
+    update_once || true
+    sleep "$INTERVAL"
+  done
+}
+
+cmd="${1:-status}"
+case "$cmd" in
+  once|--once)
+    update_once
+    ;;
+  start)
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+      echo "already running (pid $(cat "$PIDFILE"))"
+      exit 0
+    fi
+    nohup "$0" __loop >> "$LOGFILE" 2>&1 &
+    echo $! > "$PIDFILE"
+    echo "ok: companion started (pid $!), log: $LOGFILE"
+    ;;
+  __loop)
+    run_loop
+    ;;
+  stop)
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+      kill "$(cat "$PIDFILE")" && echo "ok: companion stopped"
+    else
+      echo "not running"
+    fi
+    rm -f "$PIDFILE"
+    ;;
+  status)
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+      echo "running (pid $(cat "$PIDFILE")), interval ${INTERVAL}s"
+      tail -3 "$LOGFILE" 2>/dev/null || true
+    else
+      echo "stopped"
+    fi
+    ;;
+  *)
+    echo "usage: companion start|stop|status|once" >&2
+    exit 1
+    ;;
+esac

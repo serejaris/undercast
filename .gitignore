@@ -1,0 +1,13 @@
+state.json
+state.json.migrated
+.DS_Store
+node_modules/
+server.log
+undercast.config.json
+CLAUDE.local.md
+# legacy in-repo daemon files (state now lives in ~/.local/state/undercast)
+companion.pid
+companion.log
+chatfeed.pid
+chatfeed.log
+chatfeed-state.json

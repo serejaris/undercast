@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>prompt-widget</title>
+<style>
+  :root {
+    --bg: rgba(10, 10, 10, 0.88);
+    --fg: #e7e7e7;
+    --accent: #4ade80;
+    --mono: "JetBrains Mono", "SF Mono", Menlo, monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; background: transparent; overflow: hidden; }
+  body.demo { background: linear-gradient(135deg, #1b2735, #090a0f); }
+
+  #card {
+    position: fixed;
+    left: 24px; bottom: 12px;
+    max-width: 72%;
+    display: flex;
+    align-items: stretch;
+    background: var(--bg);
+    border: 1px solid rgba(74, 222, 128, 0.35);
+    border-radius: 6px;
+    overflow: hidden;
+    font-family: var(--mono);
+    opacity: 0;
+    transform: translateY(16px);
+    transition: opacity 0.35s ease, transform 0.35s ease;
+    pointer-events: none;
+  }
+  #card.shown { opacity: 1; transform: translateY(0); }
+
+  #badge {
+    display: flex;
+    align-items: center;
+    gap: 0.55em;
+    padding: 0 0.95em;
+    background: var(--accent);
+    color: #06140a;
+    font-weight: 700;
+    font-size: 17px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    white-space: nowrap;
+  }
+  #badge .dot {
+    width: 0.5em; height: 0.5em;
+    border-radius: 50%;
+    background: #06140a;
+    animation: blink 1.6s ease-in-out infinite;
+  }
+  @keyframes blink { 50% { opacity: 0.25; } }
+
+  #textwrap {
+    padding: 14px 18px;
+    font-size: 24px;
+    line-height: 1.45;
+    color: var(--fg);
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    overflow-wrap: anywhere;
+  }
+  #caret {
+    display: inline-block;
+    width: 0.55em; height: 1.05em;
+    margin-left: 2px;
+    background: var(--accent);
+    vertical-align: -0.15em;
+    animation: blink 1s steps(1) infinite;
+  }
+</style>
+</head>
+<body>
+  <div id="card">
+    <div id="badge"><span class="dot"></span><span>prompt</span></div>
+    <div id="textwrap"><span id="text"></span><span id="caret"></span></div>
+  </div>
+
+<script>
+  const params = new URLSearchParams(location.search);
+  if (params.get('demo')) document.body.classList.add('demo');
+  const TTL = (parseInt(params.get('ttl') || '20', 10)) * 1000; // visible lifetime, sec
+  const MAX_CHARS = 240;
+  const TYPE_MS = 1600; // whole text types in ~this long regardless of length
+
+  const card = document.getElementById('card');
+  const textEl = document.getElementById('text');
+  let typeTimer = null;
+  let hideTimer = null;
+  let shownTs = 0;
+
+  function hide() {
+    clearInterval(typeTimer);
+    clearTimeout(hideTimer);
+    card.classList.remove('shown');
+  }
+
+  function show(text) {
+    clearInterval(typeTimer);
+    clearTimeout(hideTimer);
+
+    let t = text.replace(/\s+/g, ' ').trim();
+    if (t.length > MAX_CHARS) t = t.slice(0, MAX_CHARS - 1) + '…';
+
+    textEl.textContent = '';
+    card.classList.add('shown');
+
+    if (params.get('instant')) {
+      // headless screenshot mode: new headless Chrome dumps right after load,
+      // before timers fire — render fully and skip enter animation
+      card.style.transition = 'none';
+      textEl.textContent = t;
+    } else {
+      // typewriter via textContent — no HTML injection surface
+      let i = 0;
+      const step = Math.max(1, Math.round(t.length / (TYPE_MS / 16)));
+      typeTimer = setInterval(() => {
+        i = Math.min(t.length, i + step);
+        textEl.textContent = t.slice(0, i);
+        if (i >= t.length) clearInterval(typeTimer);
+      }, 16);
+    }
+
+    hideTimer = setTimeout(hide, TTL);
+  }
+
+  function handle(data) {
+    if (!data || !data.text) { hide(); return; }
+    // SSE replays the last prompt on (re)connect — skip if its moment has passed
+    if (data.ts && Date.now() - data.ts > TTL) return;
+    if (data.ts && data.ts === shownTs) return; // reconnect, already showing this one
+    shownTs = data.ts || 0;
+    show(data.text);
+  }
+
+  function connect() {
+    const es = new EventSource('/prompt-events');
+    es.addEventListener('prompt', (e) => {
+      try { handle(JSON.parse(e.data)); } catch { /* null or bad payload — ignore */ }
+    });
+    es.onerror = () => {
+      es.close();
+      setTimeout(connect, 2000);
+    };
+  }
+  connect();
+
+  if (params.get('demo') && !params.get('quiet')) {
+    // demo sample only — real prompts arrive via SSE untranslated; ?lang=en|ru, default en
+    const SAMPLES = {
+      en: 'make the transparent terminal look stunning on stream',
+      ru: 'сделай так, чтобы прозрачный терминал выглядел офигенно на стриме',
+    };
+    const sample = SAMPLES[params.get('lang')] || SAMPLES.en;
+    if (params.get('instant')) show(sample);
+    else setTimeout(() => show(sample), 300);
+  }
+</script>
+</body>
+</html>

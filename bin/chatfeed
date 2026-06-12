@@ -1,0 +1,473 @@
+#!/usr/bin/env node
+// YouTube → ticker chat feed daemon.
+// Polls the current live stream's chat (auto-resolved via the channel's /live
+// redirect, no quota) and, optionally, new comments under an announce video;
+// filters them and posts to the overlay's POST /chat. Zero dependencies.
+//
+// Channel: --channel @handle > UNDERCAST_CHANNEL > undercast.config.json "channel".
+// OAuth reuses a youtubeuploader-format token file; token values are never printed.
+// Usage: chatfeed start [announce-video-url] | stop | status | once [announce-video-url] | smoke
+import { readFileSync, writeFileSync, existsSync, openSync, rmSync, mkdirSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { loadConfig } from '../lib/config.mjs';
+
+const SELF = fileURLToPath(import.meta.url);
+const config = loadConfig();
+mkdirSync(config.stateDir, { recursive: true });
+const BASE = config.baseUrl;
+const PIDFILE = join(config.stateDir, 'chatfeed.pid');
+const LOGFILE = join(config.stateDir, 'chatfeed.log');
+const STATE_FILE = join(config.stateDir, 'chatfeed-state.json');
+const TOKEN_FILE = config.ytToken;
+
+const RESOLVE_INTERVAL_MS = 120_000; // no live yet — recheck the handle
+const COMMENTS_INTERVAL_MS = 60_000;
+const CHAT_MIN_INTERVAL_MS = 5_000; // floor under pollingIntervalMillis
+const ERR_BACKOFF_MIN_MS = 5_000; // first retry after a cycle error
+const ERR_BACKOFF_MAX_MS = 600_000; // doubling backoff cap
+const MAX_TEXT_LEN = 200;
+const SEEN_CAP = 5000;
+
+function log(msg) {
+  console.log(`${new Date().toISOString().slice(11, 19)} ${msg}`);
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// --- persistent daemon state: seen ids survive restarts so nothing reposts ---
+
+const feedState = loadFeedState();
+const seen = new Set(feedState.seenIds || []);
+let seenDirty = false;
+
+function loadFeedState() {
+  if (existsSync(STATE_FILE)) {
+    try {
+      return JSON.parse(readFileSync(STATE_FILE, 'utf8'));
+    } catch {
+      // corrupted — start fresh
+    }
+  }
+  return { seenIds: [], announceVideoId: null, commentsPrimedFor: null, liveVideoId: null };
+}
+
+function saveFeedState() {
+  feedState.seenIds = Array.from(seen).slice(-SEEN_CAP);
+  writeFileSync(STATE_FILE, JSON.stringify(feedState));
+  seenDirty = false;
+}
+
+// --- OAuth: refresh youtubeuploader's token; values stay out of logs ---
+
+let tokenCache = { value: null, expiresAt: 0 };
+
+async function accessToken() {
+  if (tokenCache.value && Date.now() < tokenCache.expiresAt - 60_000) return tokenCache.value;
+  const t = JSON.parse(readFileSync(TOKEN_FILE, 'utf8'));
+  const res = await fetch(t.token_uri, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: t.refresh_token,
+      client_id: t.client_id,
+      client_secret: t.client_secret,
+    }),
+  });
+  if (!res.ok) {
+    log(`token refresh failed: HTTP ${res.status}`);
+    throw new Error(`token refresh failed: HTTP ${res.status}`);
+  }
+  const data = await res.json();
+  tokenCache = { value: data.access_token, expiresAt: Date.now() + (data.expires_in || 3600) * 1000 };
+  log('token refreshed');
+  return tokenCache.value;
+}
+
+async function ytApi(resource, params) {
+  const token = await accessToken();
+  const url = new URL(`https://www.googleapis.com/youtube/v3/${resource}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url, { headers: { authorization: `Bearer ${token}` } });
+  if (!res.ok) {
+    let reason = '';
+    try {
+      const j = await res.json();
+      reason = j?.error?.errors?.[0]?.reason || j?.error?.status || '';
+    } catch {
+      // non-JSON error body
+    }
+    const err = new Error(`youtube ${resource}: HTTP ${res.status}${reason ? ` (${reason})` : ''}`);
+    err.status = res.status;
+    err.reason = reason;
+    throw err;
+  }
+  return res.json();
+}
+
+// --- live resolution: handle redirect costs no quota ---
+
+function parseVideoId(input) {
+  if (/^[\w-]{11}$/.test(input)) return input;
+  try {
+    const u = new URL(input);
+    const v = u.searchParams.get('v');
+    if (v && /^[\w-]{11}$/.test(v)) return v;
+    if (u.hostname === 'youtu.be') {
+      const id = u.pathname.slice(1, 12);
+      if (/^[\w-]{11}$/.test(id)) return id;
+    }
+    const m = u.pathname.match(/\/(?:live|shorts|embed)\/([\w-]{11})/);
+    if (m) return m[1];
+  } catch {
+    // not a URL
+  }
+  return null;
+}
+
+// the channel's /live page redirects to the current broadcast — costs no API quota
+function liveHandleUrl() {
+  const handle = config.channel.startsWith('@') ? config.channel : `@${config.channel}`;
+  return `https://www.youtube.com/${handle}/live`;
+}
+
+function requireChannel() {
+  if (!config.channel) {
+    console.error(
+      'no YouTube channel configured — pass --channel @yourhandle, set UNDERCAST_CHANNEL=@yourhandle, or add "channel" to undercast.config.json'
+    );
+    process.exit(1);
+  }
+}
+
+async function resolveLiveVideoId() {
+  const res = await fetch(liveHandleUrl(), {
+    redirect: 'follow',
+    headers: { 'user-agent': 'Mozilla/5.0 (Macintosh) undercast-chatfeed' },
+  });
+  try {
+    const v = new URL(res.url).searchParams.get('v');
+    if (v && /^[\w-]{11}$/.test(v)) return v;
+  } catch {
+    // keep looking in the HTML
+  }
+  const html = await res.text();
+  const m = html.match(/rel="canonical" href="https:\/\/www\.youtube\.com\/watch\?v=([\w-]{11})"/);
+  return m ? m[1] : null;
+}
+
+async function getActiveLiveChatId(videoId) {
+  const data = await ytApi('videos', { part: 'liveStreamingDetails', id: videoId });
+  return data.items?.[0]?.liveStreamingDetails?.activeLiveChatId || null;
+}
+
+// --- filters: heuristics only, no LLM in the hot path ---
+
+function cleanText(raw) {
+  return String(raw)
+    .replace(/https?:\/\/\S+/gi, ' ')
+    .replace(/\bwww\.\S+/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// id-level dedup + text heuristics; null text marks a non-text event (skipped, still marked seen)
+function handleMessage(source, id, author, text) {
+  if (!id || seen.has(id)) return;
+  seen.add(id);
+  seenDirty = true;
+  if (text == null) return;
+  const cleaned = cleanText(text);
+  if (!cleaned || cleaned.length > MAX_TEXT_LEN) return;
+  return postChat(author || 'anonymous', cleaned, source);
+}
+
+async function postChat(author, text, source) {
+  try {
+    const res = await fetch(`${BASE}/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ author, text }),
+    });
+    if (!res.ok) {
+      log(`post failed: HTTP ${res.status}`);
+      return;
+    }
+    log(`${source}: ${author}: ${text.slice(0, 50)}`);
+  } catch (e) {
+    log(`post failed: ${e.code || e.message}`);
+  }
+}
+
+// --- pollers ---
+
+// first page per chatId is recent history, not new messages — prime it as seen without posting
+async function pollLiveChat(live) {
+  const prime = !live.primed;
+  const params = { liveChatId: live.chatId, part: 'snippet,authorDetails', maxResults: '200' };
+  if (live.pageToken) params.pageToken = live.pageToken;
+  // NB: REST path is liveChat/messages, not liveChatMessages — the latter 404s
+  const data = await ytApi('liveChat/messages', params);
+  live.pageToken = data.nextPageToken || live.pageToken;
+  for (const item of data.items || []) {
+    if (prime) {
+      if (item.id && !seen.has(item.id)) {
+        seen.add(item.id);
+        seenDirty = true;
+      }
+      continue;
+    }
+    const text = item.snippet?.type === 'textMessageEvent' ? item.snippet.displayMessage : null;
+    await handleMessage('live', item.id, item.authorDetails?.displayName, text);
+  }
+  if (prime) {
+    live.primed = true;
+    log(`live chat primed: ${(data.items || []).length} backlog messages skipped`);
+  }
+  return Math.max(CHAT_MIN_INTERVAL_MS, data.pollingIntervalMillis || 10_000);
+}
+
+// first cycle per announce video primes seen ids without posting: only fresh reactions go on air
+async function pollComments() {
+  const videoId = feedState.announceVideoId;
+  const prime = feedState.commentsPrimedFor !== videoId;
+  const data = await ytApi('commentThreads', {
+    part: 'snippet',
+    videoId,
+    order: 'time',
+    maxResults: '50',
+    textFormat: 'plainText',
+  });
+  for (const thread of data.items || []) {
+    const c = thread.snippet?.topLevelComment?.snippet;
+    const id = thread.snippet?.topLevelComment?.id || thread.id;
+    if (prime) {
+      if (id) seen.add(id);
+      continue;
+    }
+    await handleMessage('comments', id, c?.authorDisplayName, c?.textOriginal);
+  }
+  if (prime) {
+    feedState.commentsPrimedFor = videoId;
+    seenDirty = true;
+    log(`comments primed for ${videoId}: ${(data.items || []).length} existing skipped`);
+  }
+}
+
+// no arg = no announce this run: a persisted id from the previous stream must not stick
+function setupAnnounce(arg) {
+  const id = arg ? parseVideoId(arg) : null;
+  if (arg && !id) log(`bad announce url: ${arg}`);
+  if (feedState.announceVideoId !== id) {
+    if (!id) log(`announce video reset (was ${feedState.announceVideoId}); pass a URL to watch comments`);
+    feedState.announceVideoId = id;
+    feedState.commentsPrimedFor = null;
+    seenDirty = true;
+  }
+  if (id) log(`watching announce comments: ${id}`);
+}
+
+async function tryResolveLive(live, quiet) {
+  const videoId = await resolveLiveVideoId();
+  if (!videoId) {
+    if (!quiet) log('no live right now (recheck every 120s)');
+    return false;
+  }
+  const chatId = await getActiveLiveChatId(videoId);
+  if (!chatId) {
+    if (!quiet) log(`video ${videoId} has no active live chat`);
+    return false;
+  }
+  live.videoId = videoId;
+  live.chatId = chatId;
+  live.pageToken = null;
+  live.gotMessages = false;
+  live.primed = false;
+  feedState.liveVideoId = videoId;
+  seenDirty = true;
+  return true;
+}
+
+// quota 403 is an error to back off from, not a chat-over signal
+const chatGone = (e) =>
+  e.reason === 'liveChatEnded' || e.status === 404 || (e.status === 403 && e.reason !== 'quotaExceeded');
+
+async function runLoop(announceArg) {
+  log(`chatfeed: loop started (ticker: ${BASE})`);
+  setupAnnounce(announceArg);
+  const live = { videoId: null, chatId: null, pageToken: null, gotMessages: false, primed: false };
+  let nextResolveAt = 0;
+  let nextChatAt = 0;
+  let nextCommentsAt = 0;
+  let errBackoffMs = 0; // doubles per consecutive cycle error, resets on any success
+  let resolveQuiet = false; // log "no live" once, not every 120s
+  let resolvedLogged = null; // last videoId we announced as resolved
+  let notReadyLogged = null; // scheduled live whose chat 404s — complain once
+
+  while (true) {
+    const now = Date.now();
+    try {
+      if (!live.chatId && now >= nextResolveAt) {
+        const found = await tryResolveLive(live, resolveQuiet);
+        errBackoffMs = 0;
+        resolveQuiet = !found;
+        if (found && resolvedLogged !== live.videoId) {
+          log(`live resolved: ${live.videoId}`);
+          resolvedLogged = live.videoId;
+        }
+        nextResolveAt = Date.now() + RESOLVE_INTERVAL_MS;
+      }
+      if (live.chatId && now >= nextChatAt) {
+        try {
+          const interval = await pollLiveChat(live);
+          live.gotMessages = true;
+          errBackoffMs = 0;
+          nextChatAt = Date.now() + interval;
+        } catch (e) {
+          if (chatGone(e)) {
+            // a scheduled (not yet started) live resolves but its chat 404s — recheck quietly
+            if (live.gotMessages) log(`live chat over (${e.message})`);
+            else if (notReadyLogged !== live.videoId) {
+              log(`chat not ready for ${live.videoId} (${e.message}), rechecking every 120s`);
+              notReadyLogged = live.videoId;
+            }
+            live.videoId = live.chatId = live.pageToken = null;
+            resolveQuiet = true;
+            nextResolveAt = Date.now() + RESOLVE_INTERVAL_MS;
+          } else {
+            throw e;
+          }
+        }
+      }
+      if (feedState.announceVideoId && now >= nextCommentsAt) {
+        try {
+          await pollComments();
+          errBackoffMs = 0;
+        } catch (e) {
+          log(`comments poll failed: ${e.message}`);
+        }
+        nextCommentsAt = Date.now() + COMMENTS_INTERVAL_MS;
+      }
+      if (seenDirty) saveFeedState();
+    } catch (e) {
+      // push every deadline past the backoff window — never retry a failing call once a second
+      errBackoffMs = Math.min(errBackoffMs ? errBackoffMs * 2 : ERR_BACKOFF_MIN_MS, ERR_BACKOFF_MAX_MS);
+      const until = Date.now() + errBackoffMs;
+      nextResolveAt = Math.max(nextResolveAt, until);
+      nextChatAt = Math.max(nextChatAt, until);
+      nextCommentsAt = Math.max(nextCommentsAt, until);
+      log(`cycle error: ${e.message} (backoff ${Math.round(errBackoffMs / 1000)}s)`);
+    }
+    await sleep(1000);
+  }
+}
+
+// one pass of everything — for debugging before the stream
+async function runOnce(announceArg) {
+  setupAnnounce(announceArg);
+  const live = { videoId: null, chatId: null, pageToken: null, gotMessages: false, primed: false };
+  if (await tryResolveLive(live, false)) {
+    log(`live resolved: ${live.videoId}`);
+    try {
+      await pollLiveChat(live);
+    } catch (e) {
+      if (chatGone(e)) log(`chat not available yet (${e.message})`);
+      else throw e;
+    }
+  }
+  if (feedState.announceVideoId) await pollComments();
+  if (seenDirty) saveFeedState();
+}
+
+// --- CLI (companion-style) ---
+
+function alivePid() {
+  if (!existsSync(PIDFILE)) return null;
+  const pid = Number(readFileSync(PIDFILE, 'utf8').trim());
+  if (!pid) return null;
+  try {
+    process.kill(pid, 0);
+    return pid;
+  } catch {
+    return null;
+  }
+}
+
+// --channel flag may appear anywhere; it wins over env/config
+const argv = process.argv.slice(2);
+const channelFlagAt = argv.indexOf('--channel');
+if (channelFlagAt !== -1) {
+  const [, value] = argv.splice(channelFlagAt, 2);
+  if (value) config.channel = value;
+}
+const [cmd = 'status', arg] = argv;
+
+switch (cmd) {
+  case 'once':
+    requireChannel();
+    await runOnce(arg);
+    break;
+  case '__loop':
+    requireChannel();
+    await runLoop(arg);
+    break;
+  case 'start': {
+    requireChannel();
+    const pid = alivePid();
+    if (pid) {
+      console.log(`already running (pid ${pid})`);
+      break;
+    }
+    const fd = openSync(LOGFILE, 'a');
+    // env carries the resolved channel into the detached daemon (flag does not survive otherwise)
+    const child = spawn(process.execPath, [SELF, '__loop', ...(arg ? [arg] : [])], {
+      detached: true,
+      stdio: ['ignore', fd, fd],
+      env: { ...process.env, UNDERCAST_CHANNEL: config.channel },
+    });
+    child.unref();
+    writeFileSync(PIDFILE, String(child.pid));
+    console.log(`ok: chatfeed started (pid ${child.pid}), log: ${LOGFILE}`);
+    break;
+  }
+  case 'stop': {
+    const pid = alivePid();
+    if (pid) {
+      process.kill(pid);
+      console.log('ok: chatfeed stopped');
+    } else {
+      console.log('not running');
+    }
+    rmSync(PIDFILE, { force: true });
+    break;
+  }
+  case 'status': {
+    const pid = alivePid();
+    if (pid) {
+      console.log(`running (pid ${pid})`);
+      try {
+        const tail = readFileSync(LOGFILE, 'utf8').trimEnd().split('\n').slice(-3).join('\n');
+        if (tail) console.log(tail);
+      } catch {
+        // no log yet
+      }
+    } else {
+      console.log('stopped');
+    }
+    break;
+  }
+  // smoke: OAuth refresh + one quota-cheap videos.list — prints statuses only, never token values
+  case 'smoke': {
+    await accessToken();
+    const data = await ytApi('videos', { part: 'snippet', id: 'dQw4w9WgXcQ' });
+    console.log(`videos.list: HTTP 200, items: ${(data.items || []).length}`);
+    break;
+  }
+  default:
+    console.error(
+      'usage: chatfeed start [announce-url] | stop | status | once [announce-url] | smoke  [--channel @handle]'
+    );
+    process.exit(1);
+}

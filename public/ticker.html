@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ticker</title>
+<style>
+  :root {
+    --bar-h: 64px;
+    --bg: rgba(10, 10, 10, 0.88);
+    --fg: #e7e7e7;
+    --accent: #4ade80;
+    --mono: "JetBrains Mono", "SF Mono", Menlo, monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; background: transparent; overflow: hidden; }
+  body.demo { background: linear-gradient(135deg, #1b2735, #090a0f); }
+
+  #bar {
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    height: var(--bar-h);
+    display: flex;
+    align-items: stretch;
+    background: var(--bg);
+    border-top: 2px solid var(--accent);
+    font-family: var(--mono);
+    opacity: 1;
+    transition: opacity 0.4s ease, transform 0.4s ease;
+  }
+  #bar.hidden { opacity: 0; transform: translateY(100%); }
+
+  /* static mode chip on the left, outside the scrolling viewport */
+  #modechip {
+    display: none;
+    align-items: center;
+    padding-left: 14px;
+    font-size: calc(var(--bar-h) * 0.34);
+  }
+
+  #viewport {
+    flex: 1;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    mask-image: linear-gradient(to right, transparent 0, black 24px, black calc(100% - 24px), transparent 100%);
+    -webkit-mask-image: linear-gradient(to right, transparent 0, black 24px, black calc(100% - 24px), transparent 100%);
+  }
+  #track {
+    display: flex;
+    white-space: nowrap;
+    will-change: transform;
+  }
+  .chunk {
+    color: var(--fg);
+    font-size: calc(var(--bar-h) * 0.34);
+    padding-right: 0;
+  }
+  .chunk .sep { color: var(--accent); padding: 0 1.1em; }
+  .chip {
+    font-size: 0.62em;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    padding: 0.18em 0.55em;
+    border-radius: 3px;
+    margin-right: 0.9em;
+    vertical-align: 0.12em;
+  }
+  .chip-now  { color: #06140a; background: #4ade80; }
+  .chip-news { color: #03131b; background: #38bdf8; }
+  .chip-chat { color: #1d1404; background: #fbbf24; }
+  .chip-plan { color: #fff; background: deeppink; }
+  .pl-done { color: #6f6f6f; }
+  .pl-done .tick { color: #4ade80; }
+  .pl-cur { color: #fff; font-weight: 700; }
+  .pl-cur .arrow { color: deeppink; }
+  .pl-next { color: #6f6f6f; }
+  .pl-gap { padding: 0 0.7em; color: #3f3f3f; }
+
+  /* static message view (mode=message): scroll stops, one message types out */
+  #message {
+    flex: 1;
+    display: none;
+    align-items: center;
+    padding: 0 24px;
+    overflow: hidden;
+    white-space: nowrap;
+    color: var(--fg);
+    font-size: calc(var(--bar-h) * 0.34);
+  }
+  #message .author { color: #fbbf24; font-weight: 700; }
+  #message .cursor { color: var(--accent); animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+</style>
+</head>
+<body>
+  <div id="bar" class="hidden">
+    <div id="modechip"></div>
+    <div id="viewport"><div id="track"></div></div>
+    <div id="message"><span class="author"></span><span class="body"></span><span class="cursor">▌</span></div>
+  </div>
+
+<script>
+  const params = new URLSearchParams(location.search);
+  if (params.get('demo')) document.body.classList.add('demo');
+  const barH = parseInt(params.get('h') || '64', 10);
+  document.documentElement.style.setProperty('--bar-h', barH + 'px');
+
+  // static UI labels only — user content is never translated; ?lang=en|ru, default en
+  const L10N = {
+    en: { plan: 'plan', chat: 'chat', now: 'now', news: 'news' },
+    ru: { plan: 'план', chat: 'чат', now: 'сейчас', news: 'news' },
+  };
+  const lang = Object.hasOwn(L10N, params.get('lang')) ? params.get('lang') : 'en';
+  const L = L10N[lang];
+  document.documentElement.lang = lang;
+
+  // contract with server.mjs: it holds a message for length * TYPE_MS_PER_CHAR + 8000 ms
+  const TYPE_MS_PER_CHAR = 35;
+
+  const bar = document.getElementById('bar');
+  const viewport = document.getElementById('viewport');
+  const track = document.getElementById('track');
+  const modeChip = document.getElementById('modechip');
+  const msgBox = document.getElementById('message');
+  const msgAuthor = msgBox.querySelector('.author');
+  const msgBody = msgBox.querySelector('.body');
+  const msgCursor = msgBox.querySelector('.cursor');
+  let anim = null;
+
+  // typing state keyed by message.shown_at — re-renders (resize, repeated SSE state)
+  // must never restart an in-progress or finished typewriter
+  let typeTimer = null;
+  let typedKey = null;
+  let typedFull = '';
+  let typedAuthorLen = 0;
+  let typedCount = 0;
+
+  function stopTyping() {
+    if (typeTimer) { clearInterval(typeTimer); typeTimer = null; }
+  }
+
+  // textContent only — user-supplied author/text never hits innerHTML
+  function setTyped(n) {
+    msgAuthor.textContent = typedFull.slice(0, Math.min(n, typedAuthorLen));
+    msgBody.textContent = n > typedAuthorLen ? typedFull.slice(typedAuthorLen, n) : '';
+    msgCursor.style.display = n < typedFull.length ? '' : 'none';
+  }
+
+  function startTyping() {
+    stopTyping();
+    typeTimer = setInterval(() => {
+      typedCount++;
+      setTyped(typedCount);
+      if (typedCount >= typedFull.length) stopTyping();
+    }, TYPE_MS_PER_CHAR);
+  }
+
+  const MODE_CHIPS = { plan: [L.plan, 'chip-plan'], message: [L.chat, 'chip-chat'] };
+
+  function renderModeChip(mode) {
+    const def = MODE_CHIPS[mode];
+    modeChip.style.display = def ? 'flex' : 'none';
+    modeChip.innerHTML = def ? `<span class="chip ${def[1]}">${def[0]}</span>` : '';
+  }
+
+  function render(state) {
+    let mode = ['plan', 'message', 'off'].includes(state.mode) ? state.mode : 'off';
+    // resilience: mode=message without a message must not leak the raw feed under a «чат» chip
+    if (mode === 'message' && !state.message) mode = 'plan';
+    renderModeChip(mode);
+    if (mode === 'message') renderMessage(state);
+    else renderScroll(state, mode);
+  }
+
+  function renderMessage(state) {
+    if (anim) { anim.cancel(); anim = null; }
+    track.innerHTML = '';
+    viewport.style.display = 'none';
+    msgBox.style.display = 'flex';
+    bar.classList.toggle('hidden', state.visible === false);
+
+    const msg = state.message;
+    if (msg.shown_at === typedKey) {
+      // same message — keep typing (or stay fully typed); resume if a re-render stalled it
+      if (!typeTimer && typedCount < typedFull.length) startTyping();
+      return;
+    }
+    const author = msg.author ? String(msg.author) : '';
+    typedKey = msg.shown_at;
+    typedFull = author ? `${author}: ${msg.text}` : String(msg.text);
+    typedAuthorLen = author.length;
+    typedCount = 0;
+    setTyped(0);
+    startTyping();
+  }
+
+  function renderScroll(state, mode) {
+    stopTyping();
+    typedKey = null;
+    msgBox.style.display = 'none';
+    viewport.style.display = '';
+
+    let items = (state.items || []).filter(Boolean);
+    if (mode === 'plan') {
+      // plan mode: only the plan segment + the "now" slot ride the line
+      items = items.filter((it) => (typeof it === 'string' ? 'note' : it.type) === 'now');
+    }
+    const planSteps = state.plan?.steps || [];
+    const show = state.visible !== false && (items.length > 0 || planSteps.length > 0);
+    bar.classList.toggle('hidden', !show);
+    if (anim) { anim.cancel(); anim = null; }
+    track.innerHTML = '';
+    if (!show) return;
+
+    let planHtml = '';
+    if (planSteps.length) {
+      // in plan mode the static chip on the left already names the segment
+      planHtml =
+        (mode === 'off' ? `<span class="chip chip-plan">${L.plan}</span>` : '') +
+        planSteps
+          .map((s) => {
+            if (s.status === 'done') return `<span class="pl-done"><span class="tick">✓</span> ${escapeHtml(s.text)}</span>`;
+            if (s.status === 'current') return `<span class="pl-cur"><span class="arrow">▶</span> ${escapeHtml(s.text)}</span>`;
+            return `<span class="pl-next">· ${escapeHtml(s.text)}</span>`;
+          })
+          .join('<span class="pl-gap">—</span>') +
+        '<span class="sep">◆</span>';
+    }
+
+    const CHIPS = { now: L.now, news: L.news, chat: L.chat };
+    const html = planHtml + items
+      .map((it) => {
+        const item = typeof it === 'string' ? { type: 'note', text: it } : it;
+        const chip = CHIPS[item.type]
+          ? `<span class="chip chip-${item.type}">${CHIPS[item.type]}</span>`
+          : '';
+        return `${chip}${escapeHtml(item.text)}<span class="sep">◆</span>`;
+      })
+      .join('');
+
+    // one chunk to measure, then clone enough copies to cover 2x viewport for a seamless loop
+    const chunk = document.createElement('div');
+    chunk.className = 'chunk';
+    chunk.innerHTML = html;
+    track.appendChild(chunk);
+
+    requestAnimationFrame(() => {
+      const w = chunk.getBoundingClientRect().width;
+      if (w === 0) return;
+      const copies = Math.max(2, Math.ceil((window.innerWidth * 2) / w));
+      for (let i = 1; i < copies; i++) track.appendChild(chunk.cloneNode(true));
+      const speed = state.speed > 0 ? state.speed : 90; // px/s
+      anim = track.animate(
+        [{ transform: 'translateX(0)' }, { transform: `translateX(${-w}px)` }],
+        { duration: (w / speed) * 1000, iterations: Infinity }
+      );
+    });
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[c]));
+  }
+
+  let lastState = null;
+
+  function connect() {
+    const es = new EventSource('/events');
+    es.addEventListener('state', (e) => {
+      lastState = JSON.parse(e.data);
+      document.fonts.ready.then(() => render(lastState));
+    });
+    es.onerror = () => {
+      es.close();
+      setTimeout(connect, 2000);
+    };
+  }
+  connect();
+
+  let resizeTimer = null;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => lastState && render(lastState), 200);
+  });
+</script>
+</body>
+</html>
