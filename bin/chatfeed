@@ -253,10 +253,9 @@ async function pollLiveChat(live) {
     for (const item of missed.slice(tailStart)) await emitLive(item);
     live.primed = true;
     log(`live chat primed: ${items.length} backlog, ${missed.length} since watch start, showed last ${missed.length - tailStart}`);
-    return Math.max(CHAT_MIN_INTERVAL_MS, data.pollingIntervalMillis || 10_000);
+  } else {
+    for (const item of items) await emitLive(item);
   }
-
-  for (const item of items) await emitLive(item);
   return Math.max(CHAT_MIN_INTERVAL_MS, data.pollingIntervalMillis || 10_000);
 }
 
@@ -327,12 +326,14 @@ async function tryResolveLive(live, quiet) {
 const chatGone = (e) =>
   e.reason === 'liveChatEnded' || e.status === 404 || (e.status === 403 && e.reason !== 'quotaExceeded');
 
+const newLive = () => ({ videoId: null, chatId: null, pageToken: null, gotMessages: false, primed: false, watchStartedAt: Date.now() });
+
 async function runLoop(announceArg) {
   log(`chatfeed: loop started (ticker: ${BASE})`);
   setupAnnounce(announceArg);
   // watchStartedAt anchors the missed-start window: backlog posted after we began watching is
   // the stream start we owe the ticker, even if we only connected minutes later (see pollLiveChat)
-  const live = { videoId: null, chatId: null, pageToken: null, gotMessages: false, primed: false, watchStartedAt: Date.now() };
+  const live = newLive();
   let nextResolveAt = 0;
   let nextChatAt = 0;
   let nextCommentsAt = 0;
@@ -341,6 +342,17 @@ async function runLoop(announceArg) {
   let resolvedLogged = null; // last videoId we announced as resolved
   let notReadyId = null; // live whose chat isn't serving yet — track to log once + time the fast window
   let notReadySince = 0; // when that not-ready state began, for the START_WINDOW_MS fast recheck
+
+  // centralised lifecycle for the "chat not ready yet" window — prevents resolve 'ready' from
+  // resetting notReadySince in the same iteration where chat-404 would re-anchor it to now
+  const clearNotReady = () => { notReadyId = null; notReadySince = 0; };
+  function scheduleNotReadyRecheck(videoId) {
+    const firstTime = notReadyId !== videoId;
+    if (firstTime) { notReadyId = videoId; notReadySince = Date.now(); }
+    const fast = Date.now() - notReadySince < START_WINDOW_MS;
+    nextResolveAt = Date.now() + (fast ? START_RECHECK_MS : RESOLVE_INTERVAL_MS);
+    return firstTime; // caller decides whether to log
+  }
 
   while (true) {
     const now = Date.now();
@@ -354,21 +366,15 @@ async function runLoop(announceArg) {
             log(`live resolved: ${live.videoId}`);
             resolvedLogged = live.videoId;
           }
-          notReadyId = null;
-          notReadySince = 0;
+          // 'ready' means chatId resolved — not that liveChat/messages is serving yet;
+          // notReady lifecycle is owned by the chat-404 path so we don't touch it here
           nextResolveAt = Date.now() + RESOLVE_INTERVAL_MS;
         } else if (outcome === 'pending') {
           // a just-started/upcoming live found but its chat isn't serving yet — recheck fast
           // within the start window so we connect close to when the chat opens, not 120s later
-          if (notReadyId !== videoId) {
-            notReadyId = videoId;
-            notReadySince = Date.now();
-          }
-          const fast = Date.now() - notReadySince < START_WINDOW_MS;
-          nextResolveAt = Date.now() + (fast ? START_RECHECK_MS : RESOLVE_INTERVAL_MS);
+          scheduleNotReadyRecheck(videoId);
         } else {
-          notReadyId = null;
-          notReadySince = 0;
+          clearNotReady();
           nextResolveAt = Date.now() + RESOLVE_INTERVAL_MS;
         }
       }
@@ -376,8 +382,7 @@ async function runLoop(announceArg) {
         try {
           const interval = await pollLiveChat(live);
           live.gotMessages = true;
-          notReadyId = null;
-          notReadySince = 0;
+          clearNotReady();
           errBackoffMs = 0;
           nextChatAt = Date.now() + interval;
         } catch (e) {
@@ -385,19 +390,13 @@ async function runLoop(announceArg) {
             const videoId = live.videoId;
             if (live.gotMessages) {
               log(`live chat over (${e.message})`);
-              notReadyId = null;
-              notReadySince = 0;
+              clearNotReady();
               nextResolveAt = Date.now() + RESOLVE_INTERVAL_MS;
             } else {
               // a just-started live resolves but its chat still 404s — recheck fast for the first
               // START_WINDOW_MS so the stream start isn't missed by minutes, then fall back to 120s
-              if (notReadyId !== videoId) {
-                notReadyId = videoId;
-                notReadySince = Date.now();
+              if (scheduleNotReadyRecheck(videoId))
                 log(`chat not ready for ${videoId} (${e.message}), rechecking every ${START_RECHECK_MS / 1000}s`);
-              }
-              const fast = Date.now() - notReadySince < START_WINDOW_MS;
-              nextResolveAt = Date.now() + (fast ? START_RECHECK_MS : RESOLVE_INTERVAL_MS);
             }
             live.videoId = live.chatId = live.pageToken = null;
             resolveQuiet = true;
@@ -432,7 +431,7 @@ async function runLoop(announceArg) {
 // one pass of everything — for debugging before the stream
 async function runOnce(announceArg) {
   setupAnnounce(announceArg);
-  const live = { videoId: null, chatId: null, pageToken: null, gotMessages: false, primed: false, watchStartedAt: Date.now() };
+  const live = newLive();
   const { outcome } = await tryResolveLive(live, false);
   if (outcome === 'ready') {
     log(`live resolved: ${live.videoId}`);
