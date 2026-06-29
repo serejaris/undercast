@@ -23,6 +23,9 @@ const STATE_FILE = join(config.stateDir, 'chatfeed-state.json');
 const TOKEN_FILE = config.ytToken;
 
 const RESOLVE_INTERVAL_MS = 120_000; // no live yet — recheck the handle
+const START_RECHECK_MS = 20_000; // fresh live whose chat still 404s — recheck fast, not every 120s
+const START_WINDOW_MS = 15 * 60_000; // ...for this long after first seeing the live, then fall back
+const BACKLOG_TAIL_CAP = 10; // first connect: show at most the last N missed-start messages (matches server FIFO cap)
 const COMMENTS_INTERVAL_MS = 60_000;
 const CHAT_MIN_INTERVAL_MS = 5_000; // floor under pollingIntervalMillis
 const ERR_BACKOFF_MIN_MS = 5_000; // first retry after a cycle error
@@ -158,9 +161,15 @@ async function resolveLiveVideoId() {
   return m ? m[1] : null;
 }
 
-async function getActiveLiveChatId(videoId) {
-  const data = await ytApi('videos', { part: 'liveStreamingDetails', id: videoId });
-  return data.items?.[0]?.liveStreamingDetails?.activeLiveChatId || null;
+// status distinguishes a started broadcast from a scheduled one: an upcoming stream
+// already carries an activeLiveChatId, but liveChat/messages 404s until it goes live
+async function getLiveState(videoId) {
+  const data = await ytApi('videos', { part: 'snippet,liveStreamingDetails', id: videoId });
+  const item = data.items?.[0];
+  return {
+    chatId: item?.liveStreamingDetails?.activeLiveChatId || null,
+    status: item?.snippet?.liveBroadcastContent || null, // 'live' | 'upcoming' | 'none'
+  };
 }
 
 // --- filters: heuristics only, no LLM in the hot path ---
@@ -203,28 +212,49 @@ async function postChat(author, text, source) {
 
 // --- pollers ---
 
-// first page per chatId is recent history, not new messages — prime it as seen without posting
-async function pollLiveChat(live) {
+function primeSeen(item) {
+  if (item.id && !seen.has(item.id)) {
+    seen.add(item.id);
+    seenDirty = true;
+  }
+}
+
+function emitLive(item) {
+  const text = item.snippet?.type === 'textMessageEvent' ? item.snippet.displayMessage : null;
+  return handleMessage('live', item.id, item.authorDetails?.displayName, text);
+}
+
+// The first page per chatId is YouTube's recent-history backlog, not just new messages.
+// On a late join to an in-progress stream that history is noise → prime it as seen. But
+// when the daemon was already watching (started before the broadcast) and only connected
+// late because liveChat/messages 404'd for minutes, that same backlog IS the stream start
+// we owe the ticker. Split by publish time: anything posted before we started watching is
+// real history (prime); anything posted after is the missed start (emit the last N so a long
+// 404 window doesn't dump dozens of messages at once).
+async function pollLiveChat(live, watchStartedAt) {
   const prime = !live.primed;
   const params = { liveChatId: live.chatId, part: 'snippet,authorDetails', maxResults: '200' };
   if (live.pageToken) params.pageToken = live.pageToken;
   // NB: REST path is liveChat/messages, not liveChatMessages — the latter 404s
   const data = await ytApi('liveChat/messages', params);
   live.pageToken = data.nextPageToken || live.pageToken;
-  for (const item of data.items || []) {
-    if (prime) {
-      if (item.id && !seen.has(item.id)) {
-        seen.add(item.id);
-        seenDirty = true;
-      }
-      continue;
-    }
-    const text = item.snippet?.type === 'textMessageEvent' ? item.snippet.displayMessage : null;
-    await handleMessage('live', item.id, item.authorDetails?.displayName, text);
-  }
+  const items = data.items || [];
+
   if (prime) {
+    const watchStart = watchStartedAt || 0;
+    const missed = []; // posted after we started watching — the start we missed to 404
+    for (const item of items) {
+      const postedAt = Date.parse(item.snippet?.publishedAt || '') || 0;
+      if (postedAt >= watchStart) missed.push(item);
+      else primeSeen(item); // pre-existing history of a stream already running before us
+    }
+    const tailStart = Math.max(0, missed.length - BACKLOG_TAIL_CAP);
+    missed.slice(0, tailStart).forEach(primeSeen); // older than the tail — skip, keep the ticker calm
+    for (const item of missed.slice(tailStart)) await emitLive(item);
     live.primed = true;
-    log(`live chat primed: ${(data.items || []).length} backlog messages skipped`);
+    log(`live chat primed: ${items.length} backlog, ${missed.length} since watch start, showed last ${missed.length - tailStart}`);
+  } else {
+    for (const item of items) await emitLive(item);
   }
   return Math.max(CHAT_MIN_INTERVAL_MS, data.pollingIntervalMillis || 10_000);
 }
@@ -269,16 +299,18 @@ function setupAnnounce(arg) {
   if (id) log(`watching announce comments: ${id}`);
 }
 
+// returns { outcome, videoId }: 'ready' (chat connected) | 'pending' (broadcast found but chat
+// not serving yet — upcoming, or messages still warming up) | 'none' (no broadcast at all)
 async function tryResolveLive(live, quiet) {
   const videoId = await resolveLiveVideoId();
   if (!videoId) {
     if (!quiet) log('no live right now (recheck every 120s)');
-    return false;
+    return { outcome: 'none', videoId: null };
   }
-  const chatId = await getActiveLiveChatId(videoId);
-  if (!chatId) {
-    if (!quiet) log(`video ${videoId} has no active live chat`);
-    return false;
+  const { chatId, status } = await getLiveState(videoId);
+  if ((status && status !== 'live') || !chatId) {
+    if (!quiet) log(`video ${videoId} not live yet (${status || 'no chat'}), rechecking`);
+    return { outcome: 'pending', videoId };
   }
   live.videoId = videoId;
   live.chatId = chatId;
@@ -287,55 +319,90 @@ async function tryResolveLive(live, quiet) {
   live.primed = false;
   feedState.liveVideoId = videoId;
   seenDirty = true;
-  return true;
+  return { outcome: 'ready', videoId };
 }
 
 // quota 403 is an error to back off from, not a chat-over signal
 const chatGone = (e) =>
   e.reason === 'liveChatEnded' || e.status === 404 || (e.status === 403 && e.reason !== 'quotaExceeded');
 
+const newLive = () => ({ videoId: null, chatId: null, pageToken: null, gotMessages: false, primed: false });
+
 async function runLoop(announceArg) {
   log(`chatfeed: loop started (ticker: ${BASE})`);
   setupAnnounce(announceArg);
-  const live = { videoId: null, chatId: null, pageToken: null, gotMessages: false, primed: false };
+  const live = newLive();
+  // watchStartedAt anchors the missed-start window: backlog posted after we began watching is the
+  // stream start we owe the ticker, even if we only connected minutes later (see pollLiveChat). It is
+  // daemon-lifetime, NOT per-session — kept out of `live` so a stream change never re-anchors it.
+  const watchStartedAt = Date.now();
   let nextResolveAt = 0;
   let nextChatAt = 0;
   let nextCommentsAt = 0;
   let errBackoffMs = 0; // doubles per consecutive cycle error, resets on any success
   let resolveQuiet = false; // log "no live" once, not every 120s
   let resolvedLogged = null; // last videoId we announced as resolved
-  let notReadyLogged = null; // scheduled live whose chat 404s — complain once
+  let notReady = null; // { id, since } while a found live's chat isn't serving yet — else null
+
+  // centralised lifecycle for the not-ready window. The 'ready' resolve branch must NOT clear it:
+  // doing so would reset `since` every cycle in the resolve↔404 oscillation (the bug this guards).
+  // Anchored here (pending + chat-404 paths), cleared only on a real connect or stream-gone.
+  const clearNotReady = () => { notReady = null; };
+  function scheduleNotReadyRecheck(videoId) {
+    const now = Date.now();
+    const firstTime = notReady?.id !== videoId;
+    if (firstTime) notReady = { id: videoId, since: now };
+    const fast = now - notReady.since < START_WINDOW_MS;
+    nextResolveAt = now + (fast ? START_RECHECK_MS : RESOLVE_INTERVAL_MS);
+    return firstTime; // caller decides whether to log
+  }
 
   while (true) {
     const now = Date.now();
     try {
       if (!live.chatId && now >= nextResolveAt) {
-        const found = await tryResolveLive(live, resolveQuiet);
+        const { outcome, videoId } = await tryResolveLive(live, resolveQuiet);
         errBackoffMs = 0;
-        resolveQuiet = !found;
-        if (found && resolvedLogged !== live.videoId) {
-          log(`live resolved: ${live.videoId}`);
-          resolvedLogged = live.videoId;
+        resolveQuiet = outcome !== 'ready';
+        if (outcome === 'ready') {
+          if (resolvedLogged !== live.videoId) {
+            log(`live resolved: ${live.videoId}`);
+            resolvedLogged = live.videoId;
+          }
+          // 'ready' means chatId resolved — not that liveChat/messages is serving yet; must NOT
+          // touch the notReady window here (clearing it would reset the recheck anchor every cycle)
+          nextResolveAt = Date.now() + RESOLVE_INTERVAL_MS;
+        } else if (outcome === 'pending') {
+          // a just-started/upcoming live found but its chat isn't serving yet — recheck fast
+          // within the start window so we connect close to when the chat opens, not 120s later
+          scheduleNotReadyRecheck(videoId);
+        } else {
+          clearNotReady();
+          nextResolveAt = Date.now() + RESOLVE_INTERVAL_MS;
         }
-        nextResolveAt = Date.now() + RESOLVE_INTERVAL_MS;
       }
       if (live.chatId && now >= nextChatAt) {
         try {
-          const interval = await pollLiveChat(live);
+          const interval = await pollLiveChat(live, watchStartedAt);
           live.gotMessages = true;
+          clearNotReady();
           errBackoffMs = 0;
           nextChatAt = Date.now() + interval;
         } catch (e) {
           if (chatGone(e)) {
-            // a scheduled (not yet started) live resolves but its chat 404s — recheck quietly
-            if (live.gotMessages) log(`live chat over (${e.message})`);
-            else if (notReadyLogged !== live.videoId) {
-              log(`chat not ready for ${live.videoId} (${e.message}), rechecking every 120s`);
-              notReadyLogged = live.videoId;
+            const videoId = live.videoId;
+            if (live.gotMessages) {
+              log(`live chat over (${e.message})`);
+              clearNotReady();
+              nextResolveAt = Date.now() + RESOLVE_INTERVAL_MS;
+            } else {
+              // a just-started live resolves but its chat still 404s — recheck fast for the first
+              // START_WINDOW_MS so the stream start isn't missed by minutes, then fall back to 120s
+              if (scheduleNotReadyRecheck(videoId))
+                log(`chat not ready for ${videoId} (${e.message}), rechecking every ${START_RECHECK_MS / 1000}s`);
             }
             live.videoId = live.chatId = live.pageToken = null;
             resolveQuiet = true;
-            nextResolveAt = Date.now() + RESOLVE_INTERVAL_MS;
           } else {
             throw e;
           }
@@ -367,15 +434,19 @@ async function runLoop(announceArg) {
 // one pass of everything — for debugging before the stream
 async function runOnce(announceArg) {
   setupAnnounce(announceArg);
-  const live = { videoId: null, chatId: null, pageToken: null, gotMessages: false, primed: false };
-  if (await tryResolveLive(live, false)) {
+  const live = newLive();
+  const watchStartedAt = Date.now();
+  const { outcome, videoId } = await tryResolveLive(live, false);
+  if (outcome === 'ready') {
     log(`live resolved: ${live.videoId}`);
     try {
-      await pollLiveChat(live);
+      await pollLiveChat(live, watchStartedAt);
     } catch (e) {
       if (chatGone(e)) log(`chat not available yet (${e.message})`);
       else throw e;
     }
+  } else if (outcome === 'pending') {
+    log(`video ${videoId} found but chat not ready yet`);
   }
   if (feedState.announceVideoId) await pollComments();
   if (seenDirty) saveFeedState();

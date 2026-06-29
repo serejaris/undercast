@@ -105,7 +105,7 @@ After the stream, `undercast plan export chapters` prints YouTube chapter timeco
 
 Messages pass heuristic filters before reaching the ticker: URLs stripped, texts over 200 characters skipped, non-text events (stickers, super chats) skipped, duplicates dropped by id (the seen-set survives restarts). No LLM in the hot path.
 
-Auth: a YouTube Data API OAuth token in [youtubeuploader](https://github.com/porjo/youtubeuploader) format (`UNDERCAST_YT_TOKEN`). Scope `youtube.force-ssl` covers both live chat and comments. Before the broadcast goes live the daemon idles politely, rechecking every 2 minutes; when the chat ends it goes back to looking for the next one.
+Auth: a YouTube Data API OAuth token in [youtubeuploader](https://github.com/porjo/youtubeuploader) format (`UNDERCAST_YT_TOKEN`). Scope `youtube.force-ssl` covers both live chat and comments. Before a broadcast exists the daemon idles politely, rechecking every 2 minutes; once your stream appears it polls quickly so the opening chat lands on the ticker from the start — start it before you go live; when the chat ends it goes back to looking for the next one.
 
 ## Interstitials and the prompt widget
 
