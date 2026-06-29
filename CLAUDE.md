@@ -19,7 +19,7 @@ Work on this product goes through GitHub issues with mini-PRDs. No issue — no 
 | Drive the ticker (now/news/chat/note channels) | `undercast ticker now/news/chat/set/add/clear/mode/speed/hide/show/status` |
 | Ticker modes: plan in the background, viewer messages interrupt with a typing effect | `undercast ticker mode plan/off` (off = legacy flat ribbon); server-side FIFO queue cap 10, each message shown exactly once |
 | Auto-summary of the stream from Granola: the "now" slot + a flash on topic change | `undercast companion start/stop/status/once` (daemon) |
-| Stream plan as auto-history of stages from the live transcript: ✓ past + ▶ current, timestamps, chapter export | companion builds it itself (`POST /plan/append`); manual — `undercast plan append/show/export/clear` (`set` is debug-only) |
+| Stream plan as auto-history of stages: ✓ past + ▶ current, timestamps, chapter export | pre-air: `plan set "A" "B" …` (no flash); on-air: `plan next` / `plan append` (flash); auto: companion via `POST /plan/append`; `plan show/export/clear` |
 | YouTube chat into the ticker: live chat + new comments under an announce video | `undercast chatfeed start [announce-url]/stop/status/once` (daemon); OAuth from a youtubeuploader-format token, finds the live video via the channel's `/live` redirect (channel from `UNDERCAST_CHANNEL` or `undercast.config.json`) |
 | Any OBS request (scenes, sources, statuses, transforms) | `undercast obs req <RequestType> ['<json>']` |
 | Screenshot of a source or scene from OBS | `undercast obs screenshot <sourceName> <out.png> [width]` |
@@ -30,6 +30,140 @@ Work on this product goes through GitHub issues with mini-PRDs. No issue — no 
 Old `bin/ticker`, `bin/plan`, `bin/screen` are deprecated wrappers around the same subcommands.
 
 Channel semantics and the HTTP API — in [README.md](README.md).
+
+## Architecture (what talks to what)
+
+```
+OBS Studio
+  ├─ browser source "ticker"  → http://127.0.0.1:8722/ticker   (bottom bar, SSE)
+  └─ browser source "screens" → http://127.0.0.1:8722/screens  (full-canvas interstitials, SSE)
+
+undercast serve (server.mjs :8722)
+  ├─ state.json — ticker + plan + screen mode (persists across restarts)
+  └─ SSE /events — pushes state to all browser sources instantly
+
+Daemons (optional, separate processes)
+  ├─ companion — Granola MCP → plan/append + now + screen flash (every 180s)
+  └─ chatfeed  — YouTube live chat → ticker chat queue (polls /live redirect)
+
+OBS config (scenes, encoder, checklist) — repo corp-streaming, NOT here.
+```
+
+**Two visual layers, one server.** Ticker and screens are independent browser sources in the same OBS scene. `screens` is transparent when `mode=off`; countdown/flash/brb cover the whole frame. Ticker keeps running underneath.
+
+**Single screen slot.** `POST /screen` always **replaces** the current interstitial mode. There is no stack — `flash` overwrites `start` (countdown), and when flash expires the mode becomes `off`, **not** back to countdown.
+
+## Go-live playbook (agent)
+
+Repo path: `~/Documents/GitHub/obs-overlay`. Run commands from there. Channel: `UNDERCAST_CHANNEL=@serejaris` (see CLAUDE.local.md).
+
+### Phase A — infrastructure (do this yourself, don't tell the user to run)
+
+```bash
+cd ~/Documents/GitHub/obs-overlay
+
+# 1. Server
+./bin/undercast serve status || ./bin/undercast serve start
+
+# 2. OBS sources on the active program scene (idempotent)
+./bin/undercast obs add-ticker
+./bin/undercast obs add-screens
+
+# 3. Fresh plan for this stream (use plan set — see "Plan semantics" below)
+./bin/undercast plan clear
+./bin/undercast ticker clear
+./bin/undercast ticker mode plan
+./bin/undercast plan set "этап 1" "этап 2" "…"   # first step becomes ▶, rest ·
+./bin/undercast ticker now "короткая строка «сейчас»"
+
+# 4. Chatfeed (waits until YouTube /live exists — OK before Go live)
+UNDERCAST_CHANNEL=@serejaris ./bin/undercast chatfeed start
+
+# 5. Launch OBS if not running
+pgrep -x OBS >/dev/null || open -a OBS
+```
+
+Verify: `curl -sf http://127.0.0.1:8722/state | python3 -m json.tool` and `lsof -nP -i :8722 | grep ESTABLISHED`.
+
+### Phase B — pre-air countdown (companion MUST be off)
+
+**Stop companion before any `screen start`.** Companion fires `screen flash` on topic change; that kills the countdown mid-timer (verified 2026-06-29).
+
+```bash
+./bin/undercast companion stop
+./bin/undercast screen start "тема эфира" 2   # minutes, default 5
+```
+
+When the host is ready to switch to program:
+
+```bash
+./bin/undercast screen off
+```
+
+### Phase C — on air (start companion only if Granola records THIS stream)
+
+```bash
+# Only after Granola is actively transcribing the current broadcast:
+UNDERCAST_CHANNEL=@serejaris ./bin/undercast companion start
+```
+
+Manual stage advance (no Granola / between blocks):
+
+```bash
+./bin/undercast plan next          # current → done, next → ▶, fires flash ~7s
+./bin/undercast ticker now "…"     # update the green "now" slot
+```
+
+### Phase D — after stream
+
+```bash
+./bin/undercast chatfeed stop
+./bin/undercast companion stop
+./bin/undercast plan export chapters   # YouTube timecodes from plan timestamps
+```
+
+### Quick reference — what the host sees
+
+| Command | On screen |
+|---|---|
+| `screen start "Topic" N` | Full-screen countdown, kicker «стрим начнётся через», figlet timer |
+| `screen off` | Interstitial disappears (ticker + program visible) |
+| `screen flash "Text"` | Full-screen «сейчас», scramble animation, 8s then off |
+| `screen brb` / `end` | Break / end cards |
+| `ticker mode plan` | Bottom bar: plan steps ✓▶· + messages from chat interrupt |
+| `plan next` | Advances plan + flash with new stage title |
+
+Logs: `~/.local/state/undercast/{server,companion,chatfeed}.log`.
+
+## Plan semantics (agent)
+
+| Command | Behavior | Flash? |
+|---|---|---|
+| `plan set "A" "B" "C"` | All steps at once; **A = ▶**, rest pending. Use for **pre-air setup**. | No |
+| `plan append "X"` | Current → done, **X → ▶**. Use **during** stream for new stages. | **Yes** (~7s) |
+| `plan next` | Finish current, promote next. | **Yes** |
+| `plan current N` | Jump to step N (1-based). | **Yes** |
+
+**Never** run multiple `plan append` in a loop for pre-air setup — each append completes the previous step and fires a flash. For a fresh plan before Go live, always `plan set`.
+
+## Companion — when it helps vs when it breaks things
+
+Companion (`bin/companion`) calls `claude -p` with Granola MCP every **180s** (override: `COMPANION_INTERVAL`).
+
+**It does NOT require the Granola app to be open or recording.** It queries Granola MCP via `list_meetings` for today, then picks **the meeting with the latest start time** (or the latest match for `COMPANION_MEETING_TITLE` hint). An older meeting updated later in the day is **not** selected. Symptom of wrong selection: random stage titles («Фидбек-созвон», «контент-пайплайн») and `screen flash`.
+
+| Situation | companion |
+|---|---|
+| Pre-air countdown (`screen start`) | **stop** |
+| Granola not recording this stream | **stop** (drive plan manually: `plan set` / `plan next`) |
+| Before `companion start` | **`companion list`** then **`COMPANION_MEETING_TITLE=... companion verify`** (exit 0 required) |
+| Granola live-transcribing the current broadcast | **start** (after `screen off` + verify ok) |
+| Response is `NO_MEETING` | Safe — companion skips, no flash |
+| Hint set but wrong meeting matched | **skip** — no flash (guard in `bin/companion`) |
+
+Env: `COMPANION_MEETING_TITLE` (substring match on meeting title, from `granola_meeting_title` in corp-youtube `stream-meta.md`). Subcommands: `companion list` (today's meetings, latest first), `companion verify` (dry check + exit 1 on hint mismatch).
+
+`chatfeed` does **not** touch `/screen` — only the ticker chat queue. If countdown was interrupted, suspect **companion** or a manual `plan append`/`plan next`, not chatfeed.
 
 obs-websocket protocol: [v5 request reference](https://github.com/obsproject/obs-websocket/blob/master/docs/generated/protocol.md) — GetSceneList, GetStreamStatus, SetSceneItemTransform, GetSourceScreenshot, etc.
 
@@ -77,7 +211,8 @@ Dead ends (do not spend time twice):
 - **The prompt widget does not persist**: `lastPrompt` lives in server memory (a prompt is a moment, not state) and never touches `state.json`; after a server restart the widget is empty until the first POST. SSE replay sends the last prompt with its `ts` — the client discards stale ones (>TTL) itself.
 - **Hook scripts and stdin**: don't feed python a script via heredoc `python3 - <<'PY'` — the heredoc consumes stdin and the hook's JSON never arrives (silent no-op). Pass the script with `-c` and leave stdin to the data.
 - **After editing `ticker.html`** OBS keeps running the old page (SSE reconnects but the JS stays stale — symptom: `[object Object]` in the ticker). Fix: `PressInputPropertiesButton {"inputName":"ticker","propertyName":"refreshnocache"}`.
-- **Start the daemons at the top of the stream**: the plan and its timecodes (`/plan/export`) build from the first append — a companion started mid-stream covers only the tail, and chapter offsets shift relative to the video start. Before going live: `undercast ticker mode plan` + `undercast companion start` + `undercast chatfeed start [announce-url]`; after: `undercast chatfeed stop`, `undercast companion stop`, `undercast plan export chapters`.
+- **Companion vs countdown (2026-06-29)**: `screen start` and `screen flash` share one `state.screen` slot. Companion (and `plan append`/`plan next`) POST `mode:flash`, which **replaces** an active countdown; after flash ends, mode is `off` — the timer does not resume. **Always `companion stop` before `screen start`.** Start companion only when Granola is transcribing *this* stream.
+- **Daemon timing**: chapter timecodes (`plan export`) anchor to `plan.started_at` at first append/set. For accurate chapters, set the plan (`plan set`) before Go live; start companion after `screen off` so auto-appends align with the broadcast. After stream: `chatfeed stop`, `companion stop`, `plan export chapters`.
 - **YouTube liveChat has a non-standard REST path**: the resource is named `liveChatMessages` but the URL is `liveChat/messages`; calling it by resource name yields an eternal 404 indistinguishable from "the stream hasn't started yet".
 
 ## Roadmap

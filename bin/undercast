@@ -338,7 +338,7 @@ usage: undercast <command> [...]
   ticker <cmd>               ticker line: now|news|chat|set|add|clear|speed|hide|show|mode|status
   plan <cmd>                 stream plan: append|show|current|next|export|clear|set(debug)
   screen <cmd>               interstitials: start|brb|end|flash|off|status
-  companion <cmd>            Granola → plan/now daemon: start|stop|status|once
+  companion <cmd>            Granola → plan/now daemon: start|stop|status|once|list|verify
   chatfeed <cmd>             YouTube chat → ticker daemon: start|stop|status|once|smoke
   obs <cmd>                  OBS helpers: add-ticker|add-screens|req|screenshot
 

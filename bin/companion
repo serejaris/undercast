@@ -7,21 +7,87 @@
 # appends it via POST /plan/append (past steps ✓, new step ▶, no pending steps).
 #
 # Prereq: one-time OAuth — in any Claude Code session run /mcp → granola → authenticate.
-# Usage: companion start | stop | status | once
+# Usage: companion start | stop | status | once | list | verify
+#
+# Env:
+#   COMPANION_MEETING_TITLE — hint from stream-meta (substring match, case-insensitive)
+#   COMPANION_INTERVAL      — poll interval seconds (default 180)
+#   COMPANION_MODEL         — claude model (default haiku)
 set -uo pipefail
 
-# env-only config here (documented simplification: bash side does not parse undercast.config.json)
 BASE="${UNDERCAST_URL:-${TICKER_URL:-http://127.0.0.1:8722}}"
 INTERVAL="${COMPANION_INTERVAL:-180}"
 MODEL="${COMPANION_MODEL:-haiku}"
+MEETING_TITLE="${COMPANION_MEETING_TITLE:-}"
 STATE_DIR="${UNDERCAST_STATE_DIR:-$HOME/.local/state/undercast}"
+TODAY="$(date +%Y-%m-%d)"
 mkdir -p "$STATE_DIR"
 PIDFILE="$STATE_DIR/companion.pid"
 LOGFILE="$STATE_DIR/companion.log"
 
-BASE_PROMPT='Find the most recent meeting in Granola from today (it is my live stream).
-Read the tail of the transcript — the last 2-3 minutes of conversation. Identify the DOMINANT topic of those minutes.
-If there are no meetings today or the transcript is empty, answer exactly: NO_MEETING'
+pick_meeting_from_table() {
+  local table="$1"
+  MEETING_TITLE="$MEETING_TITLE" python3 -c '
+import os, re, sys
+hint = os.environ.get("MEETING_TITLE", "").strip().lower()
+rows = []
+for line in sys.stdin:
+    line = line.strip()
+    if not line or line.startswith("```") or line.upper().startswith("NO_MEETINGS"):
+        continue
+    m = re.match(r"^(\d{1,2}:\d{2})\s*\|\s*(.+?)\s*\|\s*([0-9a-f-]{36})\s*$", line, re.I)
+    if not m:
+        continue
+    t, title, mid = m.group(1), m.group(2).strip(), m.group(3)
+    h, mn = map(int, t.split(":"))
+    rows.append((h * 60 + mn, title, mid))
+if not rows:
+    sys.exit(1)
+rows.sort(key=lambda r: r[0], reverse=True)
+if hint:
+    rows = [r for r in rows if hint in r[1].lower()]
+    if not rows:
+        sys.exit(1)
+title, mid = rows[0][1], rows[0][2]
+print(f"{title} | {mid}")
+' <<<"$table"
+}
+
+resolve_meeting() {
+  local table picked attempt=0
+  while [ "$attempt" -lt 3 ]; do
+    attempt=$((attempt + 1))
+    table="$(call_claude "$(list_prompt)")" || continue
+    picked="$(pick_meeting_from_table "$table")" && { echo "$picked"; return 0; }
+    sleep 2
+  done
+  return 1
+}
+
+base_prompt() {
+  local meeting_line="$1"
+  local title id
+  title="${meeting_line% | *}"
+  id="${meeting_line##* | }"
+  cat <<EOF
+Use Granola MCP get_meeting_transcript for meeting id: $id (title: "$title").
+Read the tail of the transcript — the last 2-3 minutes. Identify the DOMINANT topic.
+If the transcript is empty, answer exactly: NO_MEETING
+
+Output MEETING line first (required):
+MEETING: $title | $id
+EOF
+}
+
+list_prompt() {
+  cat <<EOF
+Use Granola MCP list_meetings for today ($TODAY).
+Print a table sorted by start time descending (latest first).
+One meeting per line, format exactly:
+TIME | TITLE | ID
+Use 24h local time for TIME. If no meetings today, print: NO_MEETINGS
+EOF
+}
 
 current_now() {
   curl -sf "$BASE/state" | python3 -c 'import json,sys
@@ -29,7 +95,6 @@ items = json.load(sys.stdin).get("items", [])
 print(next((i["text"] for i in items if i.get("type") == "now"), ""))' 2>/dev/null
 }
 
-# existing plan steps (auto-history) as "- text" lines + current step text ("" if no plan)
 plan_context() {
   curl -sf "$BASE/state" | python3 -c 'import json,sys
 plan = json.load(sys.stdin).get("plan") or {}
@@ -39,50 +104,78 @@ for s in steps:
 print("CUR=" + next((s["text"] for s in steps if s["status"] == "current"), ""))' 2>/dev/null
 }
 
-update_once() {
-  ctx=$(plan_context)
-  cur_stage=$(echo "$ctx" | sed -n 's/^CUR=//p')
-  stages=$(echo "$ctx" | grep -v '^CUR=' || true)
+call_claude() {
+  local prompt="$1"
+  claude -p "$prompt" --model "$MODEL" --allowedTools "mcp__granola__*" 2>/dev/null
+}
+
+parse_meeting_line() {
+  local out="$1"
+  echo "$out" | sed -n 's/^MEETING:[[:space:]]*//p' | tail -1
+}
+
+meeting_guard_fail() {
+  local meeting_line="$1"
+  [ -z "$MEETING_TITLE" ] && return 1
+  [ -z "$meeting_line" ] && return 0
+  python3 -c 'import sys
+hint, line = sys.argv[1].lower(), sys.argv[2].lower()
+sys.exit(0 if hint in line else 1)' "$MEETING_TITLE" "$meeting_line"
+}
+
+build_update_prompt() {
+  local meeting_line="$1"
+  local ctx cur_stage stages
+  ctx="$(plan_context)"
+  cur_stage="$(echo "$ctx" | sed -n 's/^CUR=//p')"
+  stages="$(echo "$ctx" | grep -v '^CUR=' || true)"
 
   if [ -n "$stages" ]; then
-    prompt="$BASE_PROMPT
+    cat <<EOF
+$(base_prompt "$meeting_line")
 
 Stream stages so far (auto-history, the last one is the current stage):
 $stages
 
-Answer with EXACTLY two lines. Keep the protocol keywords (STAGE, SAME, NOW) literal; write the titles and descriptions in the language spoken in the meeting:
-STAGE: <SAME if the conversation stage has not changed from the current one (\"$cur_stage\"); otherwise a short title for the new stage — 5 words max, not repeating the stages above>
-NOW: <one line, 90 characters max — what we are doing right now; verb + essence, no quotes>"
+Then answer with EXACTLY three lines (MEETING + STAGE + NOW). Keep protocol keywords literal; write titles in the language spoken in the meeting:
+MEETING: <repeat the meeting line above exactly>
+STAGE: <SAME if unchanged from "$cur_stage"; otherwise new stage title — 5 words max, not repeating stages above>
+NOW: <one line, 90 characters max — verb + essence, no quotes>
+EOF
   else
-    prompt="$BASE_PROMPT
+    cat <<EOF
+$(base_prompt "$meeting_line")
 
 No stream stages recorded yet — this is the very beginning.
 
-Answer with EXACTLY two lines. Keep the protocol keywords (STAGE, NOW) literal; write the titles and descriptions in the language spoken in the meeting:
-STAGE: <a short title for the first stage of the stream — 5 words max>
-NOW: <one line, 90 characters max — what we are doing right now; verb + essence, no quotes>"
+Then answer with EXACTLY three lines (MEETING + STAGE + NOW). Keep protocol keywords literal; write titles in the language spoken in the meeting:
+MEETING: <repeat the meeting line above exactly>
+STAGE: <first stage title — 5 words max>
+NOW: <one line, 90 characters max — verb + essence, no quotes>
+EOF
+  fi
+}
+
+apply_response() {
+  local out="$1"
+  local meeting_line line stage moved cur_stage
+  meeting_line="$(parse_meeting_line "$out")"
+  cur_stage="$(plan_context | sed -n 's/^CUR=//p')"
+
+  if meeting_guard_fail "$meeting_line"; then
+    echo "$(date +%H:%M:%S) companion: meeting mismatch (hint: $MEETING_TITLE, got: ${meeting_line:-?}), skipping" >&2
+    return 2
   fi
 
-  out=$(claude -p "$prompt" --model "$MODEL" --allowedTools "mcp__granola__*" 2>/dev/null)
-  if [ -z "$out" ]; then
-    echo "$(date +%H:%M:%S) companion: empty response from claude" >&2
-    return 1
-  fi
-  if echo "$out" | grep -q "NO_MEETING"; then
-    echo "$(date +%H:%M:%S) companion: no meeting today, skipping"
-    return 0
-  fi
+  line="$(echo "$out" | sed -n 's/^NOW:[[:space:]]*//p' | tail -1)"
+  stage="$(echo "$out" | sed -n 's/^STAGE:[[:space:]]*//p' | tail -1 | sed 's/[[:space:]]*$//')"
 
-  line=$(echo "$out" | sed -n 's/^NOW:[[:space:]]*//p' | tail -1)
-  stage=$(echo "$out" | sed -n 's/^STAGE:[[:space:]]*//p' | tail -1 | sed 's/[[:space:]]*$//')
-  # malformed response (permission prompts, chatter) must never reach the ticker
   if [ -z "$line" ] && [ -z "$stage" ]; then
     echo "$(date +%H:%M:%S) companion: no NOW:/STAGE: in response, skipping — raw: $(echo "$out" | head -c 200)" >&2
     return 1
   fi
 
   moved=""
-  # append a new stage unless the model says SAME or echoes the current stage back (unicode-aware dedup)
   if [ -n "$stage" ] && [ "$(echo "$stage" | tr '[:upper:]' '[:lower:]')" != "same" ] \
     && python3 -c 'import sys; sys.exit(0 if sys.argv[1].strip().lower() != sys.argv[2].strip().lower() else 1)' "$stage" "$cur_stage"; then
     payload=$(python3 -c 'import json,sys; print(json.dumps({"text": sys.argv[1].strip()}))' "$stage")
@@ -106,8 +199,68 @@ NOW: <one line, 90 characters max — what we are doing right now; verb + essenc
   fi
 }
 
+update_once() {
+  local out prompt meeting_line resolved
+  resolved="$(resolve_meeting)" || {
+    echo "$(date +%H:%M:%S) companion: no meeting today, skipping"
+    return 0
+  }
+  meeting_line="$resolved"
+  prompt="$(build_update_prompt "$meeting_line")"
+  out="$(call_claude "$prompt")"
+  if [ -z "$out" ]; then
+    echo "$(date +%H:%M:%S) companion: empty response from claude" >&2
+    return 1
+  fi
+  if echo "$out" | grep -q "NO_MEETING"; then
+    echo "$(date +%H:%M:%S) companion: no meeting today, skipping"
+    return 0
+  fi
+  meeting_line="$(parse_meeting_line "$out")"
+  [ -n "$meeting_line" ] && echo "$(date +%H:%M:%S) meeting: $meeting_line"
+  apply_response "$out"
+}
+
+list_meetings() {
+  call_claude "$(list_prompt)"
+}
+
+verify_once() {
+  local out prompt meeting_line line stage rc=0 resolved
+  resolved="$(resolve_meeting)" || {
+    echo "verify: NO_MEETING — no suitable meeting today"
+    return 1
+  }
+  meeting_line="$resolved"
+  echo "picked: $meeting_line"
+  prompt="$(build_update_prompt "$meeting_line")"
+  out="$(call_claude "$prompt")"
+  if [ -z "$out" ]; then
+    echo "verify: empty response from claude" >&2
+    return 1
+  fi
+  if echo "$out" | grep -q "NO_MEETING"; then
+    echo "verify: NO_MEETING — transcript empty"
+    return 1
+  fi
+  meeting_line="$(parse_meeting_line "$out")"
+  line="$(echo "$out" | sed -n 's/^NOW:[[:space:]]*//p' | tail -1)"
+  stage="$(echo "$out" | sed -n 's/^STAGE:[[:space:]]*//p' | tail -1 | sed 's/[[:space:]]*$//')"
+  echo "MEETING: ${meeting_line:-?}"
+  echo "STAGE: ${stage:-?}"
+  echo "NOW: ${line:-?}"
+  if meeting_guard_fail "$meeting_line"; then
+    echo "verify: FAIL — hint \"$MEETING_TITLE\" not in meeting title" >&2
+    rc=1
+  else
+    echo "verify: ok"
+  fi
+  return "$rc"
+}
+
 run_loop() {
   echo "companion: loop every ${INTERVAL}s (model: $MODEL)"
+  [ -n "$MEETING_TITLE" ] && echo "companion: meeting hint: $MEETING_TITLE"
   while true; do
     update_once || true
     sleep "$INTERVAL"
@@ -118,6 +271,12 @@ cmd="${1:-status}"
 case "$cmd" in
   once|--once)
     update_once
+    ;;
+  list|--list)
+    list_meetings
+    ;;
+  verify|--verify)
+    verify_once
     ;;
   start)
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
@@ -142,13 +301,14 @@ case "$cmd" in
   status)
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
       echo "running (pid $(cat "$PIDFILE")), interval ${INTERVAL}s"
+      [ -n "$MEETING_TITLE" ] && echo "meeting hint: $MEETING_TITLE"
       tail -3 "$LOGFILE" 2>/dev/null || true
     else
       echo "stopped"
     fi
     ;;
   *)
-    echo "usage: companion start|stop|status|once" >&2
+    echo "usage: companion start|stop|status|once|list|verify" >&2
     exit 1
     ;;
 esac
