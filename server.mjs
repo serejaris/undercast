@@ -36,6 +36,7 @@ const DEFAULT_STATE = {
 let state = loadState();
 const sseClients = new Set();
 let flashSeq = 0; // invalidates pending flash auto-off when a newer screen mode arrives
+let startSeq = 0; // invalidates pending countdown auto-off when a newer screen mode arrives
 let msgSeq = 0; // invalidates pending message-advance timers when mode changes or a newer message starts
 const TYPE_MS_PER_CHAR = 35; // client typing speed — contract with ticker.html
 const QUEUE_CAP = 10;
@@ -192,6 +193,8 @@ const server = http.createServer(async (req, res) => {
         until: body.until ? Number(body.until) : minutes > 0 ? Date.now() + minutes * 60000 : null,
         since: Date.now(),
       };
+      ++startSeq; // any new screen mode invalidates a pending countdown auto-off
+      const startToken = startSeq;
       if (body.mode === 'flash') {
         const seconds = Number(body.seconds) > 0 ? Number(body.seconds) : 8;
         const token = ++flashSeq;
@@ -202,6 +205,17 @@ const server = http.createServer(async (req, res) => {
             broadcast();
           }
         }, seconds * 1000);
+      } else if (body.mode === 'start' && state.screen.until) {
+        // grace period after the countdown hits 0: let "starting now" land before the screen clears
+        const GRACE_MS = 4000;
+        const delay = Math.max(0, state.screen.until - Date.now()) + GRACE_MS;
+        setTimeout(() => {
+          if (state.screen.mode === 'start' && startSeq === startToken) {
+            state.screen = { mode: 'off', title: '', sub: '', until: null, since: Date.now() };
+            saveState();
+            broadcast();
+          }
+        }, delay);
       }
       saveState();
       broadcast();
