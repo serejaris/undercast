@@ -7,47 +7,194 @@
 # appends it via POST /plan/append (past steps ✓, new step ▶, no pending steps).
 #
 # Prereq: one-time OAuth — in any Claude Code session run /mcp → granola → authenticate.
-# Usage: companion start | stop | status | once | list | verify
+# Usage: companion start | stop | status | once | list | verify [--meeting-title "..."]
 #
 # Env:
 #   COMPANION_MEETING_TITLE — hint from stream-meta (substring match, case-insensitive)
+#   UNDERCAST_STREAM_META   — path to a stream-meta.md; hint parsed from granola_meeting_title:
+#   COMPANION_ALLOW_NO_HINT — 1 to run without any hint (otherwise fails loud, see meeting_guard_fail)
 #   COMPANION_INTERVAL      — poll interval seconds (default 180)
 #   COMPANION_MODEL         — claude model (default haiku)
+#
+# Hint precedence: --meeting-title flag > COMPANION_MEETING_TITLE > UNDERCAST_STREAM_META
+# > last hint persisted in $STATE_DIR/companion.hint (survives separate shell invocations —
+# an agent harness that can't `export` across tool calls still gets the hint through here).
+# The persisted hint is date-stamped and only honored the same calendar day (`stop` also
+# clears it) — otherwise a stale hint would silently "win" on a later stream, same
+# failure mode as the original incident this fix exists for. An explicit source
+# (--meeting-title / UNDERCAST_STREAM_META) that resolves to nothing is a hard
+# failure, not a fallback to the next tier.
 set -uo pipefail
 
 BASE="${UNDERCAST_URL:-${TICKER_URL:-http://127.0.0.1:8722}}"
 INTERVAL="${COMPANION_INTERVAL:-180}"
 MODEL="${COMPANION_MODEL:-haiku}"
-MEETING_TITLE="${COMPANION_MEETING_TITLE:-}"
 STATE_DIR="${UNDERCAST_STATE_DIR:-$HOME/.local/state/undercast}"
 TODAY="$(date +%Y-%m-%d)"
 mkdir -p "$STATE_DIR"
 PIDFILE="$STATE_DIR/companion.pid"
 LOGFILE="$STATE_DIR/companion.log"
+HINT_FILE="$STATE_DIR/companion.hint"
+
+# --meeting-title "..." — pulled out of argv before the cmd dispatch at the
+# bottom of the file, so it works alongside start/once/verify/etc.
+MEETING_TITLE_FLAG=""
+MEETING_TITLE_FLAG_SET=0
+args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --meeting-title)
+      # bare "--meeting-title" with no following arg: without this check,
+      # `shift 2` on a single remaining positional silently does nothing
+      # under set -u (no -e) — $1 stays "--meeting-title" and the loop below
+      # never terminates (found by adversarial review of the first version).
+      if [ $# -lt 2 ]; then
+        echo "companion: --meeting-title requires a value" >&2
+        exit 1
+      fi
+      MEETING_TITLE_FLAG="$2"
+      MEETING_TITLE_FLAG_SET=1
+      shift 2
+      ;;
+    --meeting-title=*)
+      MEETING_TITLE_FLAG="${1#--meeting-title=}"
+      MEETING_TITLE_FLAG_SET=1
+      shift
+      ;;
+    *)
+      # bash 3.2 (macOS default) throws "unbound variable" on "${args[@]}"
+      # when args is empty under set -u — the ${args[@]+...} guard sidesteps it.
+      args=(${args[@]+"${args[@]}"} "$1")
+      shift
+      ;;
+  esac
+done
+set -- ${args[@]+"${args[@]}"}
+
+meta_hint() {
+  local meta="$1"
+  [ -n "$meta" ] && [ -f "$meta" ] || return 1
+  python3 -c '
+import re, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    for line in f:
+        m = re.match(r"^granola_meeting_title:\s*(.+?)\s*(#.*)?$", line)
+        if m:
+            val = m.group(1).strip()
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in "\x27\"":
+                val = val[1:-1]
+            print(val)
+            break
+' "$meta"
+}
+
+# Hint resolution. Two different "no hint" outcomes are NOT the same thing:
+#   - no source given at all -> cascades down to the next tier, and
+#     eventually to require_hint's fail-loud/COMPANION_ALLOW_NO_HINT gate.
+#   - a source WAS given explicitly (--meeting-title, or UNDERCAST_STREAM_META
+#     — including the one undercast auto-discovers) but resolved to nothing
+#     -> HINT_ERROR, hard-fail, NO cascade to the persisted-hint tier below.
+#     Silently falling through to a stale hint here is exactly how undercast#16
+#     happened (companion tracked the wrong meeting, quietly).
+MEETING_TITLE=""
+HINT_ERROR=""
+
+if [ "$MEETING_TITLE_FLAG_SET" = 1 ]; then
+  if [ -n "$MEETING_TITLE_FLAG" ]; then
+    MEETING_TITLE="$MEETING_TITLE_FLAG"
+  else
+    HINT_ERROR="--meeting-title was given an empty value"
+  fi
+elif [ -n "${COMPANION_MEETING_TITLE:-}" ]; then
+  MEETING_TITLE="$COMPANION_MEETING_TITLE"
+elif [ -n "${UNDERCAST_STREAM_META:-}" ]; then
+  MEETING_TITLE="$(meta_hint "$UNDERCAST_STREAM_META")"
+  [ -z "$MEETING_TITLE" ] && HINT_ERROR="UNDERCAST_STREAM_META=$UNDERCAST_STREAM_META has no granola_meeting_title: (missing file or field)"
+fi
+
+# Last tier: a hint persisted by an earlier, separate invocation (e.g.
+# `verify` in its own shell call, `start` reading it back with no env) —
+# valid only within the same calendar day. Without the date check this file
+# never goes empty again after the first run and the whole fail-loud
+# contract goes dead (adversarial review finding).
+if [ -z "$MEETING_TITLE" ] && [ -z "$HINT_ERROR" ] && [ -f "$HINT_FILE" ]; then
+  hint_date="$(sed -n '1p' "$HINT_FILE" 2>/dev/null)"
+  if [ "$hint_date" = "$TODAY" ]; then
+    MEETING_TITLE="$(tail -n +2 "$HINT_FILE" 2>/dev/null)"
+  fi
+fi
+
+# Persist what we resolved, date-stamped, so a later separate invocation
+# picks it up without a re-export. Never persists on HINT_ERROR (MEETING_TITLE
+# stays empty in that case) — a broken explicit source must not overwrite a
+# still-valid earlier hint.
+[ -n "$MEETING_TITLE" ] && { printf '%s\n' "$TODAY"; printf '%s' "$MEETING_TITLE"; } > "$HINT_FILE"
+
+# mode=persist (default) explicitly tees into LOGFILE — for callers that run
+# before/outside the daemon's nohup redirection (start's pre-fork check, once,
+# verify). mode=loop is plain stderr — used from inside run_loop, whose stderr
+# is already `nohup ... 2>&1`-redirected into LOGFILE by `start`; teeing there
+# too would double-write every line.
+require_hint() {
+  local action="$1" mode="${2:-persist}" msg
+  if [ -n "$HINT_ERROR" ]; then
+    msg="refusing to $action — hint source given but invalid: $HINT_ERROR"
+    if [ "$mode" = loop ]; then echo "$(date +%H:%M:%S) companion: $msg" >&2
+    else echo "$(date +%H:%M:%S) companion: $msg" | tee -a "$LOGFILE" >&2; fi
+    return 1
+  fi
+  [ -n "$MEETING_TITLE" ] && return 0
+  if [ "${COMPANION_ALLOW_NO_HINT:-0}" = "1" ]; then
+    msg="WARNING — $action without a meeting hint (COMPANION_ALLOW_NO_HINT=1), any meeting today can be picked"
+    if [ "$mode" = loop ]; then echo "$(date +%H:%M:%S) companion: $msg" >&2
+    else echo "$(date +%H:%M:%S) companion: $msg" | tee -a "$LOGFILE" >&2; fi
+    return 0
+  fi
+  msg="refusing to $action — no meeting hint (set COMPANION_MEETING_TITLE, --meeting-title, or UNDERCAST_STREAM_META; override with COMPANION_ALLOW_NO_HINT=1)"
+  if [ "$mode" = loop ]; then echo "$(date +%H:%M:%S) companion: $msg" >&2
+  else echo "$(date +%H:%M:%S) companion: $msg" | tee -a "$LOGFILE" >&2; fi
+  return 1
+}
 
 pick_meeting_from_table() {
   local table="$1"
-  MEETING_TITLE="$MEETING_TITLE" python3 -c '
+  MEETING_TITLE="$MEETING_TITLE" TODAY="$TODAY" python3 -c '
 import os, re, sys
 hint = os.environ.get("MEETING_TITLE", "").strip().lower()
+today = os.environ.get("TODAY", "").strip()
+raw = 0        # non-empty, non-NO_MEETINGS lines the model printed
+mismatched = 0 # of those, parsed fine but a different date than today
 rows = []
 for line in sys.stdin:
     line = line.strip()
     if not line or line.startswith("```") or line.upper().startswith("NO_MEETINGS"):
         continue
-    m = re.match(r"^(\d{1,2}:\d{2})\s*\|\s*(.+?)\s*\|\s*([0-9a-f-]{36})\s*$", line, re.I)
+    raw += 1
+    m = re.match(r"^(\d{4}-\d{2}-\d{2})\s*\|\s*(\d{1,2}:\d{2})\s*\|\s*(.+?)\s*\|\s*([0-9a-f-]{36})\s*$", line, re.I)
     if not m:
         continue
-    t, title, mid = m.group(1), m.group(2).strip(), m.group(3)
+    d, t, title, mid = m.group(1), m.group(2), m.group(3).strip(), m.group(4)
+    if today and d != today:
+        mismatched += 1
+        continue
     h, mn = map(int, t.split(":"))
     rows.append((h * 60 + mn, title, mid))
 if not rows:
+    # Distinguish a genuine "no meetings" (raw == 0, model itself said
+    # NO_MEETINGS / printed nothing) from "the model returned rows but none
+    # survived parsing/date filtering" — the latter is a format or Granola-date
+    # problem, not an empty calendar, and looks identical to NO_MEETING to the
+    # caller unless we say so here.
+    if raw:
+        print(f"pick_meeting: model returned {raw} row(s), 0 matched today ({today}) after format/date filtering ({mismatched} date-mismatched) — check table format or Granola dates", file=sys.stderr)
     sys.exit(1)
 rows.sort(key=lambda r: r[0], reverse=True)
 if hint:
-    rows = [r for r in rows if hint in r[1].lower()]
-    if not rows:
+    matched = [r for r in rows if hint in r[1].lower()]
+    if not matched:
+        print(f"pick_meeting: {len(rows)} meeting(s) today but none matched hint {hint!r}", file=sys.stderr)
         sys.exit(1)
+    rows = matched
 title, mid = rows[0][1], rows[0][2]
 print(f"{title} | {mid}")
 ' <<<"$table"
@@ -84,8 +231,9 @@ list_prompt() {
 Use Granola MCP list_meetings for today ($TODAY).
 Print a table sorted by start time descending (latest first).
 One meeting per line, format exactly:
-TIME | TITLE | ID
-Use 24h local time for TIME. If no meetings today, print: NO_MEETINGS
+DATE | TIME | TITLE | ID
+DATE in YYYY-MM-DD, TIME in 24h local time. Only meetings whose DATE is $TODAY belong here.
+If no meetings today, print: NO_MEETINGS
 EOF
 }
 
@@ -120,7 +268,7 @@ meeting_guard_fail() {
   [ -z "$meeting_line" ] && return 0
   python3 -c 'import sys
 hint, line = sys.argv[1].lower(), sys.argv[2].lower()
-sys.exit(0 if hint in line else 1)' "$MEETING_TITLE" "$meeting_line"
+sys.exit(1 if hint in line else 0)' "$MEETING_TITLE" "$meeting_line"
 }
 
 build_update_prompt() {
@@ -262,7 +410,11 @@ run_loop() {
   echo "companion: loop every ${INTERVAL}s (model: $MODEL)"
   [ -n "$MEETING_TITLE" ] && echo "companion: meeting hint: $MEETING_TITLE"
   while true; do
-    update_once || true
+    # require_hint's own warning fires every iteration here (not just at
+    # startup) — this line is what shows up in `tail -f companion.log`.
+    if require_hint "update" loop; then
+      update_once || true
+    fi
     sleep "$INTERVAL"
   done
 }
@@ -270,12 +422,14 @@ run_loop() {
 cmd="${1:-status}"
 case "$cmd" in
   once|--once)
+    require_hint "run once" || exit 1
     update_once
     ;;
   list|--list)
     list_meetings
     ;;
   verify|--verify)
+    require_hint "verify" || exit 1
     verify_once
     ;;
   start)
@@ -283,6 +437,7 @@ case "$cmd" in
       echo "already running (pid $(cat "$PIDFILE"))"
       exit 0
     fi
+    require_hint "start" || exit 1
     nohup "$0" __loop >> "$LOGFILE" 2>&1 &
     echo $! > "$PIDFILE"
     echo "ok: companion started (pid $!), log: $LOGFILE"
@@ -297,6 +452,9 @@ case "$cmd" in
       echo "not running"
     fi
     rm -f "$PIDFILE"
+    # Clear the persisted hint too — the next `start` must resolve its own
+    # hint (fresh stream-meta.md / explicit source), not inherit this stream's.
+    rm -f "$HINT_FILE"
     ;;
   status)
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
@@ -308,7 +466,7 @@ case "$cmd" in
     fi
     ;;
   *)
-    echo "usage: companion start|stop|status|once|list|verify" >&2
+    echo "usage: companion start|stop|status|once|list|verify [--meeting-title \"...\"]" >&2
     exit 1
     ;;
 esac

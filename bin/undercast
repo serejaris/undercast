@@ -2,10 +2,11 @@
 // undercast — unified CLI for the self-aware OBS overlay.
 // Subcommands: serve | ticker | plan | screen | companion | chatfeed | obs
 // Zero dependencies. The old bin/{ticker,plan,screen} are thin wrappers over this.
-import { readFileSync, writeFileSync, existsSync, openSync, rmSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, openSync, rmSync, mkdirSync, readdirSync, statSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { homedir } from 'node:os';
 import { loadConfig } from '../lib/config.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
@@ -84,6 +85,40 @@ function execPassthrough(file, args) {
   const child = spawn(file, args, { stdio: 'inherit' });
   child.on('error', (e) => fail(`undercast: cannot run ${file}: ${e.message}`));
   child.on('exit', (code, signal) => process.exit(signal ? 1 : code ?? 0));
+}
+
+function localDateStr(d) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+// Finds the most recently modified streams/*/stream-meta.md, restricted to
+// files touched TODAY, so `companion start` gets a hint without a human
+// `export COMPANION_MEETING_TITLE=...` (that export doesn't survive separate
+// shell invocations in an agent harness — see undercast#16). The today-only
+// filter matters: postlive edits an OLD stream's stream-meta.md (bumping its
+// mtime) without it being the live stream, and a raw "most recent mtime"
+// would happily hand companion yesterday's meeting title. Base dir override:
+// UNDERCAST_YOUTUBE_REPO.
+function findFreshStreamMeta() {
+  const base = process.env.UNDERCAST_YOUTUBE_REPO
+    ? process.env.UNDERCAST_YOUTUBE_REPO.replace(/^~(?=$|\/)/, homedir())
+    : join(homedir(), 'Documents', 'GitHub', 'corp-youtube');
+  const streamsDir = join(base, 'streams');
+  if (!existsSync(streamsDir)) return null;
+  const today = localDateStr(new Date());
+  let freshest = null;
+  for (const entry of readdirSync(streamsDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const metaPath = join(streamsDir, entry.name, 'stream-meta.md');
+    if (!existsSync(metaPath)) continue;
+    const mtime = statSync(metaPath).mtime;
+    if (localDateStr(mtime) !== today) continue; // ignore stale same-file-different-day edits
+    const mtimeMs = mtime.getTime();
+    if (!freshest || mtimeMs > freshest.mtimeMs) freshest = { metaPath, mtimeMs };
+  }
+  if (freshest) console.error(`undercast: companion hint source — ${freshest.metaPath}`);
+  return freshest?.metaPath ?? null;
 }
 
 // --- serve: the overlay server, foreground or daemonized -------------------
@@ -360,9 +395,21 @@ switch (cmd) {
   case 'screen':
     await screen(rest);
     break;
-  case 'companion':
+  case 'companion': {
+    // Auto-collect the meeting hint from the current stream's stream-meta.md
+    // unless the caller already gave one explicitly (env or --meeting-title).
+    const needsHint = ['start', 'once', 'verify'].includes(rest[0]);
+    const hasExplicitHint =
+      process.env.COMPANION_MEETING_TITLE ||
+      process.env.UNDERCAST_STREAM_META ||
+      rest.some((a) => a === '--meeting-title' || a.startsWith('--meeting-title='));
+    if (needsHint && !hasExplicitHint) {
+      const metaPath = findFreshStreamMeta();
+      if (metaPath) process.env.UNDERCAST_STREAM_META = metaPath;
+    }
     execPassthrough(join(ROOT, 'bin', 'companion'), rest);
     break;
+  }
   case 'chatfeed':
     execPassthrough(join(ROOT, 'bin', 'chatfeed'), rest);
     break;
